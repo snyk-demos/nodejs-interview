@@ -1,0 +1,189 @@
+name: Snyk Differential Scan
+
+# =============================================================================
+# Gated Differential Scan
+#
+# Use instead of Snyk platform native PR check, never run both on the same repo.
+#
+# EVENTS:
+#   push feature branch    -> quick, non-blocking scan
+#   PR to main/release     -> differential gate: upload SARIF, GitHub Code
+#                             Scanning flags only new findings in diff,
+#                             required check blocks merge
+#   push to main/release   -> baseline: full scan, update baseline/monitor,
+#                             scan container artifact
+#
+# MECHANISM: gating ignores CLI exit code. Scans run continue-on-error and
+# upload SARIF; GitHub Code Scanning diffs new vs pre-existing findings per
+# PR and its check is what branch protection enforces. One uniform method
+# for SCA/SAST/IaC, no snyk-delta, no manual baseline tracking.
+# =============================================================================
+
+on:
+  push:
+    branches: [ '**' ]
+  pull_request:
+    branches: [ main, 'release/**' ]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  security-events: write   # required to upload SARIF to Code Scanning
+
+concurrency:
+  group: snyk-diff-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+jobs:
+  # ===========================================================================
+  # Quick scan on feature branches
+  # Writes a job summary so the devs see results without opening the logs. 
+  # ===========================================================================
+  quick-scan:
+    name: Quick scan (feature branch)
+    if: github.event_name == 'push' && github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/heads/release/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: 'npm'
+      - run: npm install --ignore-scripts
+      - run: npm install -g snyk
+
+      - name: Quick SCA + SAST + IaC (high/critical, non-blocking)
+        run: |
+          echo "## Snyk quick scan" >> "$GITHUB_STEP_SUMMARY"
+          echo "Fast feedback only. The PR gate is where issues block." >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          snyk test        --severity-threshold=high 2>&1 | tee -a "$GITHUB_STEP_SUMMARY" || true
+          snyk code test   --severity-threshold=high 2>&1 | tee -a "$GITHUB_STEP_SUMMARY" || true
+          snyk iac test    --severity-threshold=high 2>&1 | tee -a "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+  # ===========================================================================
+  # Differential Gate on PRs
+  # Runs SCA, SAST, IaC in parallel. Each uploads its own SARIF under
+  # its own category. GitHub Code Scanning shows only NEW alerts on the PR;
+  # branch protection requiring the code-scanning check breaks the build.
+  # ===========================================================================
+  differential:
+    name: Differential ${{ matrix.name }}
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: SCA
+            command: snyk test
+            sarif: snyk-sca.sarif
+            category: snyk-sca
+            needs_deps: true
+          - name: SAST
+            command: snyk code test
+            sarif: snyk-code.sarif
+            category: snyk-code
+            needs_deps: false
+          - name: IaC
+            command: snyk iac test
+            sarif: snyk-iac.sarif
+            category: snyk-iac
+            needs_deps: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: 'npm'
+      - name: Install dependencies (SCA only)
+        if: matrix.needs_deps
+        run: npm install --ignore-scripts
+      - run: npm install -g snyk
+
+      # continue-on-error so a non-zero exit (findings) does not skip the
+      # upload. --sarif-file-output captures ALL severities so Code Scanning
+      # can classify new vs existing; the gate severity is set in the repo's
+      # code scanning settings, not here.
+      - name: Scan ${{ matrix.name }}
+        continue-on-error: true
+        run: ${{ matrix.command }} --sarif-file-output=${{ matrix.sarif }}
+
+      # Guard: some products (e.g. IaC on a repo with no IaC files) may not
+      # emit a SARIF file. Only upload when one exists.
+      - name: Check SARIF exists
+        id: sarif
+        run: |
+          if [ -f "${{ matrix.sarif }}" ]; then echo "found=true" >> "$GITHUB_OUTPUT";
+          else echo "found=false" >> "$GITHUB_OUTPUT"; echo "No SARIF for ${{ matrix.name }} (no supported files)."; fi
+
+      - name: Upload ${{ matrix.name }} to Code Scanning
+        if: steps.sarif.outputs.found == 'true'
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: ${{ matrix.sarif }}
+          category: ${{ matrix.category }}   # distinct category per product
+
+  # ===========================================================================
+  # Baseline on push to a protected branch  (full scan + monitor + artifact)
+  # Establishes the branch baseline in Code Scanning (so future PR diffs are
+  # measured against it), refreshes the Snyk monitor, and scans the built
+  # image, which the platform can never see.
+  # ===========================================================================
+  baseline:
+    name: Baseline (protected branch)
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: 'npm'
+      - run: npm install --ignore-scripts
+      - run: npm install -g snyk
+
+      # Full scans -> SARIF -> upload (sets the branch baseline for PR diffs)
+      - name: SCA
+        continue-on-error: true
+        run: snyk test --sarif-file-output=snyk-sca.sarif
+      - name: SAST
+        continue-on-error: true
+        run: snyk code test --sarif-file-output=snyk-code.sarif
+      - name: IaC
+        continue-on-error: true
+        run: snyk iac test --sarif-file-output=snyk-iac.sarif || true
+      - name: Upload SCA baseline
+        if: hashFiles('snyk-sca.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with: { sarif_file: snyk-sca.sarif, category: snyk-sca }
+      - name: Upload SAST baseline
+        if: hashFiles('snyk-code.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with: { sarif_file: snyk-code.sarif, category: snyk-code }
+      - name: Upload IaC baseline
+        if: hashFiles('snyk-iac.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with: { sarif_file: snyk-iac.sarif, category: snyk-iac }
+
+      # Refresh the Snyk platform monitor (only meaningful if this repo is NOT
+      # SCM-imported; remove if it is, to avoid a duplicate project).
+      - name: Snyk monitor (code + deps baseline)
+        run: snyk monitor --all-projects --remote-repo-url=${{ github.server_url }}/${{ github.repository }} || true
+
+      # The artifact scan the platform can never do.
+      - name: Build image
+        run: docker build -t nova-bank-goof:${{ github.sha }} .
+      - name: Snyk Container test + monitor
+        continue-on-error: true
+        run: |
+          snyk container test    nova-bank-goof:${{ github.sha }} --file=Dockerfile --severity-threshold=high --sarif-file-output=snyk-container.sarif || true
+          snyk container monitor nova-bank-goof:${{ github.sha }} --file=Dockerfile
+      - name: Upload container baseline
+        if: hashFiles('snyk-container.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with: { sarif_file: snyk-container.sarif, category: snyk-container }
