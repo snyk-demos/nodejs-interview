@@ -2,16 +2,14 @@ name: Snyk
 # Fires ONLY on pushes to feature branches. Nothing else triggers this file,
 # so PR and baseline runs won't show a skipped job for it in the checks list.
 #
-# Fast, non-blocking feedback. Renders a per-tool markdown report into the job
-# summary, and if the branch already has an open PR (found via the GitHub API
-# with gh), posts the same report as a single sticky comment on it.
-# The PR gate is where issues actually block.
+# Fast, non-blocking feedback for lower-level branches only. Renders a
+# per-tool markdown report into the job summary. No PR decoration here,
+# that belongs to the gate workflow. The PR gate is where issues block.
 on:
   push:
     branches-ignore: [ main, 'release/**' ]
 permissions:
-  contents: read
-  pull-requests: write   # needed to find the open PR and post/update the sticky comment
+  contents: read          # summary only, nothing else is needed
 concurrency:
   group: snyk-quick-${{ github.ref }}
   cancel-in-progress: true
@@ -142,23 +140,3 @@ jobs:
           RENDER_MODE=sarif RENDER_FILE=code.sarif  RENDER_TITLE="SAST (Snyk Code)"               python3 render.py
           RENDER_MODE=sarif RENDER_FILE=iac.sarif   RENDER_TITLE="IaC"                            python3 render.py
           cat report.md >> "$GITHUB_STEP_SUMMARY"
-
-      # Push events carry no PR context, so ask the GitHub API whether this
-      # branch has an open PR and decorate it too if so.
-      - name: Find open PR for this branch
-        id: pr
-        if: always()
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          num=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$GITHUB_REF_NAME" --state open --json number --jq '.[0].number // empty')
-          echo "number=$num" >> "$GITHUB_OUTPUT"
-          [ -n "$num" ] && echo "Found open PR #$num" || echo "No open PR for this branch, summary only."
-
-      - name: PR comment (quick scan)
-        if: always() && steps.pr.outputs.number != ''
-        uses: marocchino/sticky-pull-request-comment@v3
-        with:
-          header: snyk-quick
-          number: ${{ steps.pr.outputs.number }}
-          path: report.md
