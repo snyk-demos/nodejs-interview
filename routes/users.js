@@ -43,6 +43,16 @@ router.get('/avatar', function (req, res, next) {
   })
 })
 
+// Reflected XSS: user-controlled input written into an HTML response without encoding
+router.get('/profile', function (req, res, next) {
+  const name = req.query.name
+  res.setHeader('Content-Type', 'text/html')
+  const html = '<html><body><h1>Profile</h1>' +
+    '<p>Results for: ' + name + '</p>' +
+    '</body></html>'
+  return res.send(html)
+})
+
 router.get('/', async (req, res, next) => {
   const mongoConnection = typeorm.getConnection('mysql')
   const repo = mongoConnection.getRepository("Users")
