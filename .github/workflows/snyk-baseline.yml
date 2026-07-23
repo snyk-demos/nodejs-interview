@@ -4,9 +4,7 @@ name: Snyk
 # Sets the baseline Code Scanning compares future PRs against, refreshes the
 # Snyk monitor, and scans the built image since that's something the platform
 # can't see on its own.
-#
-# No PR decoration here (there is no PR), but the job summary gets a compact
-# table of what was scanned and uploaded so the run is auditable at a glance.
+
 on:
   push:
     branches: [ main, 'release/**' ]
@@ -25,24 +23,22 @@ env:
   # 403s if Snyk Code isn't enabled there. Set SNYK_ORG as a repo variable
   # (org slug from https://app.snyk.io/org/<slug>).
   SNYK_CFG_ORG: ${{ vars.SNYK_ORG }}
-  # Image and Snyk container project are named after the repo. The project
-  # name is FIXED at first monitor, renaming later creates a second project,
-  # so this must be right before the first baseline run.
-  IMAGE_NAME: ${{ github.event.repository.name }}
 jobs:
   baseline:
     name: Baseline Refresh
     runs-on: ubuntu-latest
     steps:
+      # Container target naming: CLI container projects form their OWN target
+      # keyed by image name, they cannot be merged into the git repo target
+      # (container monitor has no --remote-repo-url).
+      - name: Set image name
+        run: echo "IMAGE_NAME=${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 18
           cache: 'npm'
       - run: npm install -g snyk
-      # IaC runs BEFORE npm install: with node_modules present, snyk iac tries
-      # to parse fixture/tsconfig JSON inside dependencies and fails with
-      # SNYK-CLI-0012 parse errors (as seen in previous runs).
       - name: IaC
         continue-on-error: true
         run: snyk iac test --sarif-file-output=snyk-iac.sarif || true
@@ -67,9 +63,7 @@ jobs:
         if: hashFiles('snyk-iac.sarif') != ''
         uses: github/codeql-action/upload-sarif@v3
         with: { sarif_file: snyk-iac.sarif, category: snyk-iac }
-      # Refreshes the Snyk platform monitor. Skip this if the repo is already
-      # SCM-imported on the platform side, otherwise you end up with a
-      # duplicate project.
+      # Refreshes the Snyk platform monitor.
       # --remote-repo-url groups all detected projects under one target in the
       # Snyk UI. --target-reference tags the snapshot with the branch, so main
       # and release/* keep separate histories instead of overwriting each other.
@@ -90,9 +84,13 @@ jobs:
       - name: Snyk Container test + monitor
         continue-on-error: true
         run: |
-          snyk container test "$IMAGE_NAME:${{ github.sha }}" --file=Dockerfile --severity-threshold=high --sarif-file-output=snyk-container.sarif || true
+          # --exclude-node-modules keeps the in-image package.json app project
+          # but drops the node_modules sub-projects (the /usr/local/lib and
+          # bundled-binary noise seen in the UI). Remove it if you want those.
+          snyk container test "$IMAGE_NAME:${{ github.sha }}" --file=Dockerfile --exclude-node-modules --severity-threshold=high --sarif-file-output=snyk-container.sarif || true
           snyk container monitor "$IMAGE_NAME:${{ github.sha }}" \
             --file=Dockerfile \
+            --exclude-node-modules \
             --project-name="$IMAGE_NAME" \
             --target-reference=${{ github.ref_name }}
       - name: Upload container baseline
