@@ -1,0 +1,128 @@
+name: Snyk Container
+# Protected-branch pushes: builds the image, scans it (decorated summary),
+# monitors it on the Snyk platform. Repo scans (deps/code) are handled by
+# the Snyk repo integration, NOT by workflows.
+on:
+  push:
+    branches: [ main, 'release/**' ]
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: snyk-container-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+  SNYK_CFG_ORG: ${{ secrets.SNYK_ORG }}   # same org secret in all workflows
+jobs:
+  container:
+    name: Container
+    runs-on: ubuntu-latest
+    steps:
+      # IMAGE_NAME = real image coordinates (repo var), fallback repo name.
+      # Fixed at first monitor; renaming later creates an orphan project.
+      - name: Set image name
+        run: |
+          IMAGE='${{ vars.IMAGE_NAME }}'
+          [ -z "$IMAGE" ] && IMAGE="${GITHUB_REPOSITORY#*/}"
+          echo "IMAGE_NAME=${IMAGE,,}" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+      - run: npm install -g snyk
+      - name: Build image
+        run: docker build -t "$IMAGE_NAME:${{ github.sha }}" .
+      # exit codes: 0 clean, 1 findings, 2 error, 3 nothing to scan; only 2 fails
+      - name: Container scan
+        id: scan
+        continue-on-error: true
+        run: |
+          set +e
+          snyk container test "$IMAGE_NAME:${{ github.sha }}" --file=Dockerfile --exclude-node-modules --severity-threshold=high --sarif-file-output=results.sarif
+          code=$?
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          if [ "$code" -eq 2 ]; then exit 2; fi
+          exit 0
+      - name: Report
+        if: always()
+        env:
+          RENDER_TITLE: Snyk Container (high/critical only)
+          RENDER_FILE: results.sarif
+          RENDER_EXIT: ${{ steps.scan.outputs.code }}
+          RENDER_OUT: report.md
+        run: |
+          cat > render.py << 'EOF'
+          import json, os
+          SEV_ORDER = ["critical", "high", "medium", "low"]
+          SEV_ICON = {"critical": "\U0001F6A8", "high": "\U0001F534", "medium": "\U0001F7E0", "low": "\U0001F7E1"}
+          SEV_LABEL = {"critical": "Critical", "high": "High", "medium": "Medium", "low": "Low"}
+          LEVEL_TO_SEV = {"error": "high", "warning": "medium", "note": "low"}
+          OPEN_BY_DEFAULT = {"critical", "high"}
+          
+          def load(path):
+              try:
+                  with open(path) as f:
+                      d = json.load(f)
+                  return d[0] if isinstance(d, list) and d else d
+              except Exception:
+                  return None
+          
+          def details_block(sev, count, rows):
+              o = " open" if sev in OPEN_BY_DEFAULT else ""
+              return [f"<details{o}>", f"<summary>{SEV_ICON[sev]} <b>{SEV_LABEL[sev]}</b>: {count} issue(s)</summary>", ""] + rows + ["", "</details>", ""]
+          
+          def render(path, limit=25):
+              d = load(path)
+              if not d:
+                  return ["\u26A0\uFE0F Scan produced no output. Check the step log."]
+              run = (d.get("runs") or [{}])[0]
+              rules = {r.get("id"): (r.get("shortDescription") or {}).get("text") or r.get("id")
+                       for r in ((run.get("tool") or {}).get("driver") or {}).get("rules", [])}
+              results = run.get("results") or []
+              if not results:
+                  return ["\u2705 No findings."]
+              by_sev = {}
+              for r in results:
+                  by_sev.setdefault(LEVEL_TO_SEV.get(r.get("level"), "low"), []).append(r)
+              parts = " | ".join(f"{SEV_ICON[s]} {SEV_LABEL[s]}: {len(by_sev[s])}" for s in SEV_ORDER if s in by_sev)
+              out = [f"**{len(results)} findings** | {parts}", ""]
+              for sev in SEV_ORDER:
+                  if sev not in by_sev:
+                      continue
+                  rows = ["| Issue | Location |", "|---|---|"]
+                  for r in by_sev[sev][:limit]:
+                      loc = ((r.get("locations") or [{}])[0].get("physicalLocation") or {})
+                      uri = (loc.get("artifactLocation") or {}).get("uri", "?")
+                      line = (loc.get("region") or {}).get("startLine", "?")
+                      rows.append(f"| {rules.get(r.get('ruleId'), r.get('ruleId'))} | `{uri}:{line}` |")
+                  if len(by_sev[sev]) > limit:
+                      rows += ["", f"...plus {len(by_sev[sev])-limit} more, see the run log."]
+                  out += details_block(sev, len(by_sev[sev]), rows)
+              return out
+          
+          def main():
+              title = os.environ.get("RENDER_TITLE", "")
+              lines = ([f"## {title}", ""] if title else [])
+              if os.environ.get("RENDER_EXIT") == "3":
+                  lines += ["\u2139\uFE0F No supported files for this scan type in the repo, nothing to scan."]
+              else:
+                  lines += render(os.environ["RENDER_FILE"])
+              lines.append("")
+              with open(os.environ.get("RENDER_OUT", "report.md"), "a", encoding="utf-8") as f:
+                  f.write("\n".join(lines) + "\n")
+          
+          main()
+          EOF
+          python3 render.py
+          cat report.md >> "$GITHUB_STEP_SUMMARY"
+      # --project-name must be stable (no sha); --target-reference groups by
+      # branch; --exclude-node-modules drops in-image node_modules sub-projects
+      - name: Container monitor
+        continue-on-error: true
+        run: |
+          snyk container monitor "$IMAGE_NAME:${{ github.sha }}" \
+            --file=Dockerfile \
+            --exclude-node-modules \
+            --project-name="$IMAGE_NAME" \
+            --target-reference=${{ github.ref_name }}
