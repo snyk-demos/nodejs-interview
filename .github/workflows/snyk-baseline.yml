@@ -24,7 +24,11 @@ env:
   # Without this, projects land in the token's default org, and snyk code test
   # 403s if Snyk Code isn't enabled there. Set SNYK_ORG as a repo variable
   # (org slug from https://app.snyk.io/org/<slug>).
-  SNYK_CFG_ORG: ${{ secrets.SNYK_ORG }}
+  SNYK_CFG_ORG: ${{ vars.SNYK_ORG }}
+  # Image and Snyk container project are named after the repo. The project
+  # name is FIXED at first monitor, renaming later creates a second project,
+  # so this must be right before the first baseline run.
+  IMAGE_NAME: ${{ github.event.repository.name }}
 jobs:
   baseline:
     name: Baseline Refresh
@@ -76,7 +80,7 @@ jobs:
           --target-reference=${{ github.ref_name }}
           || true
       - name: Build image
-        run: docker build -t nova-bank-goof:${{ github.sha }} .
+        run: docker build -t "$IMAGE_NAME:${{ github.sha }}" .
       # Container pairing: --remote-repo-url is NOT supported on container
       # monitor, so linkage to the repo's Snyk projects happens via the org
       # plus --target-reference (same branch ref as snyk monitor above).
@@ -86,10 +90,10 @@ jobs:
       - name: Snyk Container test + monitor
         continue-on-error: true
         run: |
-          snyk container test nova-bank-goof:${{ github.sha }} --file=Dockerfile --severity-threshold=high --sarif-file-output=snyk-container.sarif || true
-          snyk container monitor nova-bank-goof:${{ github.sha }} \
+          snyk container test "$IMAGE_NAME:${{ github.sha }}" --file=Dockerfile --severity-threshold=high --sarif-file-output=snyk-container.sarif || true
+          snyk container monitor "$IMAGE_NAME:${{ github.sha }}" \
             --file=Dockerfile \
-            --project-name=nova-bank-goof \
+            --project-name="$IMAGE_NAME" \
             --target-reference=${{ github.ref_name }}
       - name: Upload container baseline
         if: hashFiles('snyk-container.sarif') != ''
