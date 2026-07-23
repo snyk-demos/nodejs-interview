@@ -20,7 +20,9 @@ SEV_ICON = {"critical": "\U0001F6A8", "high": "\U0001F534",
 SEV_LABEL = {"critical": "Critical", "high": "High",
              "medium": "Medium", "low": "Low"}
 LEVEL_TO_SEV = {"error": "high", "warning": "medium", "note": "low"}
-OPEN_BY_DEFAULT = {"critical", "high"}
+# Every section collapsed. The severity table is the only thing visible until
+# someone chooses to expand a section.
+OPEN_BY_DEFAULT = set()
 LIMIT = 25
 
 
@@ -48,10 +50,14 @@ def bucket(items, key):
     return out
 
 
-def counts_line(prefix, by_sev):
-    parts = " | ".join(f"{SEV_ICON[s]} {SEV_LABEL[s]}: {len(by_sev[s])}"
-                       for s in SEV_ORDER if s in by_sev)
-    return [f"{prefix} | {parts}", ""]
+def counts_table(prefix, by_sev):
+    """Headline plus a severity table. This is the only thing visible by
+    default; every findings section below it renders collapsed."""
+    rows = [prefix, "", "| Severity | Count |", "|---|---|"]
+    for s in SEV_ORDER:
+        if s in by_sev:
+            rows.append(f"| {SEV_ICON[s]} {SEV_LABEL[s]} | {len(by_sev[s])} |")
+    return rows + [""]
 
 
 def sarif_severity(result, rules):
@@ -78,7 +84,7 @@ def render_sarif(doc):
         return ["\u2705 No findings."]
 
     by_sev = bucket(results, lambda r: sarif_severity(r, rules))
-    out = counts_line(f"**{len(results)} findings**", by_sev)
+    out = counts_table(f"**{len(results)} findings**", by_sev)
     for sev in SEV_ORDER:
         if sev not in by_sev:
             continue
@@ -104,7 +110,7 @@ def render_sca(doc):
     for v in vulns:
         uniq.setdefault(v.get("id"), v)
     by_sev = bucket(uniq.values(), lambda v: v.get("severity", "low"))
-    out = counts_line(
+    out = counts_table(
         f"**{len(uniq)} unique issues across {len(vulns)} vulnerable paths**", by_sev)
 
     for sev in SEV_ORDER:
@@ -125,7 +131,7 @@ def render_sca(doc):
         for pkg, info in ranked[:10]:
             rows.append(f"| `{pkg}` | `{info.get('upgradeTo', '?')}` | "
                         f"{len(info.get('vulns', []))} issues |")
-        out += (["<details open>",
+        out += (["<details>",
                  "<summary>\U0001F527 <b>Top fixes by impact</b> (bump these first)</summary>",
                  ""] + rows + ["", "</details>", ""])
 
