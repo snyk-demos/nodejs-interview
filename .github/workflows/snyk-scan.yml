@@ -1,83 +1,48 @@
 name: Snyk
-# Fires ONLY on PRs targeting main/release.
+# Fires ONLY on pushes to feature branches. Nothing else triggers this file,
+# so PR and baseline runs won't show a skipped job for it in the checks list.
 #
-# Use only instead of Snyk's native PR check, running both will cause double results.
-#
-# How the gating works:
-# Every scan runs with continue-on-error and uploads its SARIF.
-# GitHub Code Scanning diffs new findings against the baseline for the target
-# branch, and the code-scanning check is what actually blocks the merge.
-#
-# Decorations: each matrix leg renders a markdown report (severity counts,
-# top fixes, finding table) into the job summary AND a sticky PR comment.
-# One comment per scan type, updated in place on every push, no comment spam.
+# Fast, non-blocking feedback for lower-level branches only. Renders a
+# per-tool markdown report into the job summary. No PR decoration here,
+# that belongs to the gate workflow. The PR gate is where issues block.
 on:
-  pull_request:
-    branches: [ main, 'release/**' ]   # filters on the PR's TARGET branch
+  push:
+    branches-ignore: [ main, 'release/**' ]
 permissions:
-  contents: read
-  security-events: write   # SARIF upload to Code Scanning
-  pull-requests: write     # sticky PR comments
-  # actions: read          # uncomment for PRIVATE repos, upload fails without it
+  contents: read          # summary only, nothing else is needed
 concurrency:
-  group: snyk-gate-${{ github.ref }}
+  group: snyk-quick-${{ github.ref }}
   cancel-in-progress: true
 env:
   SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 jobs:
-  gate:
-    name: ${{ matrix.name }} Scan
+  quick-scan:
+    name: Scan
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: SCA
-            title: SCA (open-source dependencies)
-            command: snyk test
-            sarif: snyk-sca.sarif
-            category: snyk-sca
-            # SCA also emits JSON, that's where remediation/upgrade advice lives
-            extra_flags: --json-file-output=snyk-sca.json
-            render_mode: sca
-            render_file: snyk-sca.json
-            needs_deps: true
-          - name: SAST
-            title: SAST (Snyk Code)
-            command: snyk code test
-            sarif: snyk-code.sarif
-            category: snyk-code
-            extra_flags: ''
-            render_mode: sarif
-            render_file: snyk-code.sarif
-            needs_deps: false
-          - name: IaC
-            title: IaC (Terraform/K8s/CloudFormation)
-            command: snyk iac test
-            sarif: snyk-iac.sarif
-            category: snyk-iac
-            extra_flags: ''
-            render_mode: sarif
-            render_file: snyk-iac.sarif
-            needs_deps: false
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 18
           cache: 'npm'
-      - name: Install dependencies (SCA only)
-        if: matrix.needs_deps
-        run: npm install --ignore-scripts
       - run: npm install -g snyk
 
-      # continue-on-error so findings (non-zero exit) don't skip the render and
-      # upload steps. SARIF carries every severity, Code Scanning needs the full
-      # picture to tell new from existing. The high/critical gate lives in the
-      # repo's code scanning config, not here.
-      - name: Scan ${{ matrix.name }}
+      # IaC runs BEFORE npm install on purpose: with node_modules present,
+      # snyk iac tries to parse fixture/tsconfig JSON inside dependencies and
+      # spams SNYK-CLI-0012 parse errors.
+      - name: IaC quick scan
         continue-on-error: true
-        run: ${{ matrix.command }} --sarif-file-output=${{ matrix.sarif }} ${{ matrix.extra_flags }}
+        run: snyk iac test --severity-threshold=high --sarif-file-output=iac.sarif
+
+      - run: npm install --ignore-scripts
+
+      - name: SCA quick scan
+        continue-on-error: true
+        run: snyk test --severity-threshold=high --json-file-output=sca.json
+
+      - name: SAST quick scan
+        continue-on-error: true
+        run: snyk code test --severity-threshold=high --sarif-file-output=code.sarif
 
       - name: Write report renderer
         if: always()
@@ -103,7 +68,7 @@ jobs:
                   return ["\u26A0\uFE0F Scan produced no output. Check the step log (auth error or unsupported project)."]
               vulns = d.get("vulnerabilities") or []
               if not vulns:
-                  return ["\u2705 No dependency issues at or above the configured threshold."]
+                  return ["\u2705 No high/critical dependency issues."]
               counts = {}
               for v in vulns:
                   s = v.get("severity", "unknown")
@@ -147,7 +112,7 @@ jobs:
                   line = (loc.get("region") or {}).get("startLine", "?")
                   out.append(f"| {LEVEL_MAP.get(r.get('level'), r.get('level'))} | {rules.get(r.get('ruleId'), r.get('ruleId'))} | `{uri}:{line}` |")
               if len(results) > limit:
-                  out += ["", f"...plus {len(results)-limit} more, see the Security tab or run log."]
+                  out += ["", f"...plus {len(results)-limit} more, see the run log."]
               return out
 
           def main():
@@ -163,40 +128,15 @@ jobs:
           main()
           EOF
 
-      - name: Build ${{ matrix.name }} report (summary + comment body)
+      - name: Build quick-scan report
         if: always()
-        env:
-          RENDER_MODE: ${{ matrix.render_mode }}
-          RENDER_FILE: ${{ matrix.render_file }}
-          RENDER_TITLE: ${{ matrix.title }}
-          RENDER_OUT: report.md
         run: |
-          python3 render.py
           {
-            echo "_Merge blocking is enforced by the required Code Scanning check (new findings only)._"
-            echo "_Full results: **Security tab → Code scanning**, category \`${{ matrix.category }}\`._"
-          } >> report.md
+            echo "## 🔍 Snyk quick scan (high/critical only)"
+            echo "_Fast, non-blocking feedback on \`${GITHUB_REF_NAME}\`. The PR gate is where issues block._"
+            echo ""
+          } > report.md
+          RENDER_MODE=sca   RENDER_FILE=sca.json    RENDER_TITLE="SCA (open-source dependencies)" python3 render.py
+          RENDER_MODE=sarif RENDER_FILE=code.sarif  RENDER_TITLE="SAST (Snyk Code)"               python3 render.py
+          RENDER_MODE=sarif RENDER_FILE=iac.sarif   RENDER_TITLE="IaC"                            python3 render.py
           cat report.md >> "$GITHUB_STEP_SUMMARY"
-
-      - name: PR comment (${{ matrix.name }})
-        if: always()
-        uses: marocchino/sticky-pull-request-comment@v3
-        with:
-          header: snyk-${{ matrix.name }}   # keeps each scan in its own sticky comment
-          path: report.md
-
-      # Not every product produces a file, IaC on a repo with no IaC files
-      # for example, so check before trying to upload.
-      - name: Check SARIF exists
-        id: sarif
-        if: always()
-        run: |
-          if [ -f "${{ matrix.sarif }}" ]; then echo "found=true" >> "$GITHUB_OUTPUT";
-          else echo "found=false" >> "$GITHUB_OUTPUT"; echo "No SARIF for ${{ matrix.name }} (no supported files)."; fi
-
-      - name: Upload ${{ matrix.name }} to Code Scanning
-        if: always() && steps.sarif.outputs.found == 'true'
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: ${{ matrix.sarif }}
-          category: ${{ matrix.category }}   # keep each product in its own category

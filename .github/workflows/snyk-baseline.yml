@@ -1,31 +1,28 @@
-name: Snyk Baseline
-
+name: Snyk
 # Fires ONLY on pushes to a protected branch, plus manual runs.
 #
 # Sets the baseline Code Scanning compares future PRs against, refreshes the
 # Snyk monitor, and scans the built image since that's something the platform
 # can't see on its own.
-
+#
+# No PR decoration here (there is no PR), but the job summary gets a compact
+# table of what was scanned and uploaded so the run is auditable at a glance.
 on:
   push:
     branches: [ main, 'release/**' ]
   workflow_dispatch: {}
-
 permissions:
   contents: read
   security-events: write   # needed to upload SARIF to Code Scanning
   # actions: read          # uncomment for PRIVATE repos, upload fails without it
-
 concurrency:
   group: snyk-baseline-${{ github.ref }}
   cancel-in-progress: false   # never cancel a baseline, it must complete
-
 env:
   SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-
 jobs:
   baseline:
-    name: Snyk - Baseline Refresh
+    name: Baseline Refresh
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -33,9 +30,14 @@ jobs:
         with:
           node-version: 18
           cache: 'npm'
-      - run: npm install --ignore-scripts
       - run: npm install -g snyk
-
+      # IaC runs BEFORE npm install: with node_modules present, snyk iac tries
+      # to parse fixture/tsconfig JSON inside dependencies and fails with
+      # SNYK-CLI-0012 parse errors (as seen in previous runs).
+      - name: IaC
+        continue-on-error: true
+        run: snyk iac test --sarif-file-output=snyk-iac.sarif || true
+      - run: npm install --ignore-scripts
       # Full scans, SARIF out, then upload. This is what becomes the new
       # baseline for PR diffs.
       - name: SCA
@@ -44,9 +46,6 @@ jobs:
       - name: SAST
         continue-on-error: true
         run: snyk code test --sarif-file-output=snyk-code.sarif
-      - name: IaC
-        continue-on-error: true
-        run: snyk iac test --sarif-file-output=snyk-iac.sarif || true
       - name: Upload SCA baseline
         if: hashFiles('snyk-sca.sarif') != ''
         uses: github/codeql-action/upload-sarif@v3
@@ -59,13 +58,11 @@ jobs:
         if: hashFiles('snyk-iac.sarif') != ''
         uses: github/codeql-action/upload-sarif@v3
         with: { sarif_file: snyk-iac.sarif, category: snyk-iac }
-
       # Refreshes the Snyk platform monitor. Skip this if the repo is already
       # SCM-imported on the platform side, otherwise you end up with a
       # duplicate project.
       - name: Snyk monitor (code + deps baseline)
         run: snyk monitor --all-projects --remote-repo-url=${{ github.server_url }}/${{ github.repository }} || true
-
       - name: Build image
         run: docker build -t nova-bank-goof:${{ github.sha }} .
       - name: Snyk Container test + monitor
@@ -77,3 +74,26 @@ jobs:
         if: hashFiles('snyk-container.sarif') != ''
         uses: github/codeql-action/upload-sarif@v3
         with: { sarif_file: snyk-container.sarif, category: snyk-container }
+      - name: Baseline summary
+        if: always()
+        run: |
+          python3 - << 'EOF' >> "$GITHUB_STEP_SUMMARY"
+          import json, os
+          scans = [("SCA", "snyk-sca.sarif"), ("SAST", "snyk-code.sarif"),
+                   ("IaC", "snyk-iac.sarif"), ("Container", "snyk-container.sarif")]
+          print("## \U0001F4CC Snyk baseline refresh")
+          print("_This run sets the comparison baseline for future PR gates (Code Scanning categories below)._\n")
+          print("| Scan | Findings in SARIF | Status |")
+          print("|---|---|---|")
+          for name, path in scans:
+              if os.path.isfile(path) and os.path.getsize(path) > 0:
+                  try:
+                      with open(path) as f:
+                          d = json.load(f)
+                      n = len((d.get("runs") or [{}])[0].get("results") or [])
+                      print(f"| {name} | {n} | \u2705 uploaded as `snyk-{name.lower()}` |")
+                  except Exception:
+                      print(f"| {name} | ? | \u26A0\uFE0F SARIF unreadable, check log |")
+              else:
+                  print(f"| {name} | - | \u26A0\uFE0F no output (scan failed or nothing to scan) |")
+          EOF
