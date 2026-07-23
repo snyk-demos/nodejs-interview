@@ -31,7 +31,7 @@ jobs:
   # own category. Code Scanning only shows NEW alerts on a PR, and branch
   # protection requiring that check is what blocks the merge.
   gate:
-    name: Snyk - Scan Gate | ${{ matrix.name }}
+    name: ${{ matrix.name }} Scan
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
