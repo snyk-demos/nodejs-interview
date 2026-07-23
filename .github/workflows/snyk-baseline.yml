@@ -4,9 +4,7 @@ name: Snyk
 # Sets the baseline Code Scanning compares future PRs against, refreshes the
 # Snyk monitor, and scans the built image since that's something the platform
 # can't see on its own.
-#
-# No PR decoration here (there is no PR), but the job summary gets a compact
-# table of what was scanned and uploaded so the run is auditable at a glance.
+
 on:
   push:
     branches: [ main, 'release/**' ]
@@ -55,9 +53,6 @@ jobs:
           node-version: 18
           cache: 'npm'
       - run: npm install -g snyk
-      # IaC runs BEFORE npm install: with node_modules present, snyk iac tries
-      # to parse fixture/tsconfig JSON inside dependencies and fails with
-      # SNYK-CLI-0012 parse errors (as seen in previous runs).
       - name: IaC
         continue-on-error: true
         run: >
