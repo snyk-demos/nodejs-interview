@@ -1,4 +1,4 @@
-name: Snyk Gate
+name: Snyk 
 
 # Fires ONLY on PRs targeting main/release.
 #
