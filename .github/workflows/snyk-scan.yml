@@ -17,7 +17,7 @@ env:
   SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
   # Same org as the baseline workflow, so test results, .snyk policies, and
   # Snyk Code enablement match what the platform projects use.
-  SNYK_CFG_ORG: ${{ vars.SNYK_ORG }}
+  SNYK_CFG_ORG: ${{ secrets.SNYK_ORG }}
 jobs:
   quick-scan:
     name: Scan
