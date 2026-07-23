@@ -1,82 +1,133 @@
 name: Snyk Scans
-# Drop-in caller for the Snyk scan templates. Two triggers, no double runs:
-#   - push: every push to a feature branch runs SCA, Code, and IaC, advisory,
-#     with sticky PR comments (IaC included). A push to the default branch runs
-#     only the container scan (the image never exists in Git, so the Snyk SCM
-#     integration cannot cover it) and snapshots the image with monitor.
-#   - pull_request (opened/reopened/ready_for_review only): covers the gap
-#     where the branch was pushed before the PR existed, so the sticky comments
-#     appear as soon as the PR opens. synchronize is excluded on purpose: a
-#     push to a branch with an open PR already runs once via the push event.
-# Replace YOUR-ORG/snyk-scan-templates and pin a tag.
+# Drop-in caller for the Snyk scan templates. The two triggers do not overlap,
+# so no scan ever runs twice for one commit:
+#   - pull_request owns SCA, Code, and IaC. Every commit on the PR is covered
+#     (synchronize), results are advisory, and each scan posts a sticky comment
+#     on the PR. Scanning the merge ref means you see what merging would land.
+#   - push owns the container scan on the default branch only: the image is
+#     built in CI and never exists in Git, so the Snyk SCM integration cannot
+#     cover it. The image is snapshotted to Snyk with monitor.
+# Do NOT add push for the other three: a branch push and the PR opening are two
+# events, both would fire, and every check would appear twice on the PR.
+#
+# New-findings handling: every scan uploads its SARIF to GitHub code scanning
+# (upload-sarif: "true"). Code scanning diffs each PR against the default
+# branch itself, so "new vs pre-existing" is native: alerts land on the PR
+# diff line by line, and the "Code scanning results" check reports only what
+# the PR introduces. Make that check required in branch protection to block
+# on new issues; leave fail-on-findings off so you are not gating twice.
+# Needs GitHub Code Security on private repos; it is free on public ones.
+# Replace snyk-demos/snyk-scan-templates and pin a tag.
 on:
-  push:
   pull_request:
-    types: [opened, reopened, ready_for_review]
+    types: [opened, reopened, synchronize, ready_for_review]
+  push:
+    # The one place a branch name is needed: `on:` filters cannot read the
+    # repo's default branch dynamically. Set this to yours. The job-level `if`
+    # below re-checks it against the event payload, so a wrong name here fails
+    # closed (job skips) rather than scanning the wrong branch.
+    branches: [main, master]
 
 permissions:
   contents: read
   pull-requests: write   # sticky PR comments
+  security-events: write # upload SARIF to code scanning
+  actions: read          # required by code scanning on private repos
 
 concurrency:
-  group: snyk-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Keyed on the PR (or the branch, for the default-branch push). Re-pushing
+  # to a PR cancels the previous, still-running scan for that same PR.
+  group: snyk-${{ github.event.pull_request.number || github.ref_name }}
+  # Never cancel a default-branch run: cancelling it can drop the Snyk monitor
+  # snapshot for a released image, leaving that image untracked.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   sca:
     name: SCA
-    # push to any non-default branch, or a same-repo PR opening.
-    # Fork PRs are excluded: they run without secrets, the scan cannot work.
-    if: >
-      (github.event_name == 'push' && github.ref_name != github.event.repository.default_branch) ||
-      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+    # Fork PRs are excluded: they run without secrets, so the scan cannot work.
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 18
+          node-version: 20                  # 18 is end-of-life
           cache: 'npm'
-      - run: npm install --ignore-scripts   # snyk test needs resolved deps
+      # snyk test scans the resolved tree, so install first. npm ci is faster
+      # and reproducible; it needs a lockfile, hence the fallback.
+      - run: npm ci --ignore-scripts || npm install --ignore-scripts
       - uses: snyk-demos/snyk-scan-templates/sca@v1
         with:
           snyk-token: ${{ secrets.SNYK_TOKEN }}
-          # fail-on-findings: "true"        # flip when this check should fail
+          upload-sarif: "true"              # code scanning owns new-vs-existing
           # severity-threshold: critical    # what "fail" means, per scan
           # extra-args: "--all-projects"    # monorepos
 
   code:
     name: Code
-    if: >
-      (github.event_name == 'push' && github.ref_name != github.event.repository.default_branch) ||
-      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: snyk-demos/snyk-scan-templates/code@v1
         with:
           snyk-token: ${{ secrets.SNYK_TOKEN }}
+          upload-sarif: "true"
 
   iac:
     name: IaC
-    if: >
-      (github.event_name == 'push' && github.ref_name != github.event.repository.default_branch) ||
-      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: snyk-demos/snyk-scan-templates/iac@v1
         with:
           snyk-token: ${{ secrets.SNYK_TOKEN }}
-          # pr-comment defaults to "true": IaC results land on the open PR
-          # as a sticky comment and in the run summary.
+          upload-sarif: "true"
+          # pr-comment defaults to "true": IaC results land on the PR as a
+          # sticky comment and in the run summary, with new issues called out
+          # separately from what main already had.
 
-  # Default-branch pushes only: build the release image, scan it, and snapshot
-  # it to the Snyk platform for ongoing tracking against new disclosures.
+  # Default-branch pushes only. Code scanning needs an analysis of the default
+  # branch to diff PRs against, so these scans run there too and upload. They
+  # post no comments; their whole job is to establish the base.
+  baseline:
+    name: Establish code scanning base
+    if: github.event_name == 'push' && github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+      - run: npm ci --ignore-scripts || npm install --ignore-scripts
+      - uses: snyk-demos/snyk-scan-templates/sca@v1
+        with:
+          snyk-token: ${{ secrets.SNYK_TOKEN }}
+          upload-sarif: "true"
+          pr-comment: "false"
+      - uses: snyk-demos/snyk-scan-templates/code@v1
+        with:
+          snyk-token: ${{ secrets.SNYK_TOKEN }}
+          upload-sarif: "true"
+          pr-comment: "false"
+      - uses: snyk-demos/snyk-scan-templates/iac@v1
+        with:
+          snyk-token: ${{ secrets.SNYK_TOKEN }}
+          upload-sarif: "true"
+          pr-comment: "false"
+
   container:
     name: Container
     if: github.event_name == 'push' && github.ref_name == github.event.repository.default_branch
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - run: docker build -t local/app:${{ github.sha }} .
@@ -85,6 +136,7 @@ jobs:
           snyk-token: ${{ secrets.SNYK_TOKEN }}
           image: local/app:${{ github.sha }}
           pr-comment: "false"               # default-branch push has no PR
+          upload-sarif: "true"              # base for PR container alerts
           monitor: "true"                   # track this image in Snyk
           project-name: app                 # stable name, no sha or registry
           target-reference: ${{ github.ref_name }}
