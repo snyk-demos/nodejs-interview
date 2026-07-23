@@ -1,5 +1,5 @@
 name: Snyk Scans (CI only)
-# Copy to .github/workflows/ in your repo, then replace YOUR-ORG below.
+# Copy to .github/workflows/ in your repo, then replace snyk-demos below.
 #
 # For repos where the Snyk SCM integration already imports and monitors this
 # repository: the platform side is covered there, so this workflow publishes
@@ -42,7 +42,7 @@ jobs:
           node-version: 20
           cache: 'npm'
       - run: npm ci --ignore-scripts || npm install --ignore-scripts
-      - uses: YOUR-ORG/snyk-scan-templates/sca@v1
+      - uses: snyk-demos/snyk-scan-templates/sca@v1
         with:
           snyk-token: ${{ secrets.SNYK_TOKEN }}
           # monitor deliberately left at its "false" default: the SCM
@@ -54,7 +54,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - uses: YOUR-ORG/snyk-scan-templates/code@v1
+      - uses: snyk-demos/snyk-scan-templates/code@v1
         with:
           snyk-token: ${{ secrets.SNYK_TOKEN }}
   iac:
@@ -67,7 +67,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - uses: YOUR-ORG/snyk-scan-templates/iac@v1
+      - uses: snyk-demos/snyk-scan-templates/iac@v1
         with:
           snyk-token: ${{ secrets.SNYK_TOKEN }}
   # Pushes or merges to the default branch only: the on.push trigger fires
@@ -81,7 +81,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: docker build -t local/app:${{ github.sha }} .
-      - uses: YOUR-ORG/snyk-scan-templates/container@v1
+      - uses: snyk-demos/snyk-scan-templates/container@v1
         with:
           snyk-token: ${{ secrets.SNYK_TOKEN }}
           image: local/app:${{ github.sha }}
