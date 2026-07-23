@@ -5,6 +5,9 @@ name: Snyk
 # Non-blocking feedback for lower-level branches only. Renders a
 # per-tool markdown report into the job summary. No PR decoration here,
 # that belongs to the gate workflow. The PR gate is where issues block.
+#
+# NOTE: the report lives on the workflow run's Summary page (Actions tab ->
+# click the run). That is where GITHUB_STEP_SUMMARY renders, by design.
 on:
   push:
     branches-ignore: [ main, 'release/**' ]
@@ -34,18 +37,39 @@ jobs:
       # snyk iac tries to parse fixture/tsconfig JSON inside dependencies and
       # spams SNYK-CLI-0012 parse errors.
       - name: IaC Scan
+        id: iac
         continue-on-error: true
-        run: snyk iac test --severity-threshold=high --sarif-file-output=iac.sarif
+        run: |
+          set +e
+          snyk iac test --severity-threshold=high --sarif-file-output=iac.sarif
+          code=$?
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          if [ "$code" -eq 2 ]; then exit 2; fi
+          exit 0
 
       - run: npm install --ignore-scripts
 
       - name: SCA Scan
+        id: sca
         continue-on-error: true
-        run: snyk test --severity-threshold=high --json-file-output=sca.json
+        run: |
+          set +e
+          snyk test --severity-threshold=high --json-file-output=sca.json
+          code=$?
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          if [ "$code" -eq 2 ]; then exit 2; fi
+          exit 0
 
       - name: SAST Scan
+        id: sast
         continue-on-error: true
-        run: snyk code test --severity-threshold=high --sarif-file-output=code.sarif
+        run: |
+          set +e
+          snyk code test --severity-threshold=high --sarif-file-output=code.sarif
+          code=$?
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          if [ "$code" -eq 2 ]; then exit 2; fi
+          exit 0
 
       - name: Write report renderer
         if: always()
@@ -146,7 +170,10 @@ jobs:
               src = os.environ["RENDER_FILE"]
               title = os.environ.get("RENDER_TITLE", "")
               lines = ([f"### {title}", ""] if title else [])
-              lines += render_sca(src) if mode == "sca" else render_sarif(src)
+              if os.environ.get("RENDER_EXIT") == "3":
+                  lines += ["ℹ️ No supported files for this scan type in the repo, nothing to scan."]
+              else:
+                  lines += render_sca(src) if mode == "sca" else render_sarif(src)
               lines.append("")
               with open(os.environ.get("RENDER_OUT", "report.md"), "a", encoding="utf-8") as f:
                   f.write("\n".join(lines) + "\n")
@@ -162,7 +189,7 @@ jobs:
             echo "_Fast, non-blocking feedback on \`${GITHUB_REF_NAME}\`. The PR gate is where issues block._"
             echo ""
           } > report.md
-          RENDER_MODE=sca   RENDER_FILE=sca.json    RENDER_TITLE="SCA (open-source dependencies)" python3 render.py
-          RENDER_MODE=sarif RENDER_FILE=code.sarif  RENDER_TITLE="SAST (Snyk Code)"               python3 render.py
-          RENDER_MODE=sarif RENDER_FILE=iac.sarif   RENDER_TITLE="IaC"                            python3 render.py
+          RENDER_EXIT="${{ steps.sca.outputs.code }}"  RENDER_MODE=sca   RENDER_FILE=sca.json   RENDER_TITLE="SCA (open-source dependencies)" python3 render.py
+          RENDER_EXIT="${{ steps.sast.outputs.code }}" RENDER_MODE=sarif RENDER_FILE=code.sarif RENDER_TITLE="SAST (Snyk Code)"               python3 render.py
+          RENDER_EXIT="${{ steps.iac.outputs.code }}"  RENDER_MODE=sarif RENDER_FILE=iac.sarif  RENDER_TITLE="IaC"                            python3 render.py
           cat report.md >> "$GITHUB_STEP_SUMMARY"
