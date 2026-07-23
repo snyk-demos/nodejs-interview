@@ -24,7 +24,7 @@ env:
   # Without this, projects land in the token's default org, and snyk code test
   # 403s if Snyk Code isn't enabled there. Set SNYK_ORG as a repo variable
   # (org slug from https://app.snyk.io/org/<slug>).
-  SNYK_CFG_ORG: ${{ vars.SNYK_ORG }}
+  SNYK_CFG_ORG: ${{ secrets.SNYK_ORG }}
 jobs:
   baseline:
     name: Baseline Refresh
