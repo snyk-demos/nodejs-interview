@@ -1,23 +1,18 @@
 name: Snyk Differential Scan
 
-# =============================================================================
-# Gated Differential Scan
+# Use this instead of Snyk's native PR check, running both will cause double results.
 #
-# Use instead of Snyk platform native PR check, never run both on the same repo.
+# What runs when:
+#   - push to a feature branch -> quick scan, doesn't block anything
+#   - PR into main/release -> the real gate, see below
+#   - push to main/release -> full scan, refreshes the baseline and monitor,
+#     scans the container image
 #
-# EVENTS:
-#   push feature branch    -> quick, non-blocking scan
-#   PR to main/release     -> differential gate: upload SARIF, GitHub Code
-#                             Scanning flags only new findings in diff,
-#                             required check blocks merge
-#   push to main/release   -> baseline: full scan, update baseline/monitor,
-#                             scan container artifact
-#
-# MECHANISM: gating ignores CLI exit code. Scans run continue-on-error and
-# upload SARIF; GitHub Code Scanning diffs new vs pre-existing findings per
-# PR and its check is what branch protection enforces. One uniform method
-# for SCA/SAST/IaC, no snyk-delta, no manual baseline tracking.
-# =============================================================================
+# How the gating actually works: Every scan runs with continue-on-error and uploads its SARIF.
+# GitHub Code Scanning is what diffs new findings against what's already
+# known for the branch, and it's the code-scanning check 
+# that actually blocks the merge. Same mechanism for SCA, SAST,
+# and IaC, so no snyk-delta and no baseline files to track.
 
 on:
   push:
@@ -28,7 +23,7 @@ on:
 
 permissions:
   contents: read
-  security-events: write   # required to upload SARIF to Code Scanning
+  security-events: write   # needed to upload SARIF to Code Scanning
 
 concurrency:
   group: snyk-diff-${{ github.workflow }}-${{ github.ref }}
@@ -38,10 +33,8 @@ env:
   SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
 jobs:
-  # ===========================================================================
-  # Quick scan on feature branches
-  # Writes a job summary so the devs see results without opening the logs. 
-  # ===========================================================================
+  # Fast, non-blocking feedback for feature branches. Dumps results into the
+  # job summary so devs don't have to dig through logs.
   quick-scan:
     name: Quick scan (feature branch)
     if: github.event_name == 'push' && github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/heads/release/')
@@ -65,12 +58,10 @@ jobs:
           snyk iac test    --severity-threshold=high 2>&1 | tee -a "$GITHUB_STEP_SUMMARY" || true
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
-  # ===========================================================================
-  # Differential Gate on PRs
-  # Runs SCA, SAST, IaC in parallel. Each uploads its own SARIF under
-  # its own category. GitHub Code Scanning shows only NEW alerts on the PR;
-  # branch protection requiring the code-scanning check breaks the build.
-  # ===========================================================================
+  # This is the actual gate. SCA, SAST, and IaC run in parallel, each one
+  # uploads its own SARIF under its own category. Code Scanning only shows
+  # NEW alerts on a PR, and branch protection requiring that check is what
+  # blocks the merge.
   differential:
     name: Differential ${{ matrix.name }}
     if: github.event_name == 'pull_request'
@@ -105,16 +96,16 @@ jobs:
         run: npm install --ignore-scripts
       - run: npm install -g snyk
 
-      # continue-on-error so a non-zero exit (findings) does not skip the
-      # upload. --sarif-file-output captures ALL severities so Code Scanning
-      # can classify new vs existing; the gate severity is set in the repo's
-      # code scanning settings, not here.
+      # continue-on-error so findings (non-zero exit) don't skip the upload
+      # step. The SARIF output includes every severity, since Code Scanning
+      # needs the full picture to tell new from existing. The actual
+      # high/critical gate lives in the repo's code scanning config, not here.
       - name: Scan ${{ matrix.name }}
         continue-on-error: true
         run: ${{ matrix.command }} --sarif-file-output=${{ matrix.sarif }}
 
-      # Guard: some products (e.g. IaC on a repo with no IaC files) may not
-      # emit a SARIF file. Only upload when one exists.
+      # Not every product produces a file, IaC on a repo with no IaC files
+      # for example, so check before trying to upload.
       - name: Check SARIF exists
         id: sarif
         run: |
@@ -126,14 +117,11 @@ jobs:
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: ${{ matrix.sarif }}
-          category: ${{ matrix.category }}   # distinct category per product
+          category: ${{ matrix.category }}   # keep each product in its own category
 
-  # ===========================================================================
-  # Baseline on push to a protected branch  (full scan + monitor + artifact)
-  # Establishes the branch baseline in Code Scanning (so future PR diffs are
-  # measured against it), refreshes the Snyk monitor, and scans the built
-  # image, which the platform can never see.
-  # ===========================================================================
+  # Runs on push to a protected branch. Sets the baseline Code Scanning
+  # compares future PRs against, refreshes the Snyk monitor, and scans the
+  # built image since that's something the platform can't see on its own.
   baseline:
     name: Baseline (protected branch)
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))
@@ -147,7 +135,8 @@ jobs:
       - run: npm install --ignore-scripts
       - run: npm install -g snyk
 
-      # Full scans -> SARIF -> upload (sets the branch baseline for PR diffs)
+      # Full scans, SARIF out, then upload. This is what becomes the new
+      # baseline for PR diffs.
       - name: SCA
         continue-on-error: true
         run: snyk test --sarif-file-output=snyk-sca.sarif
@@ -170,12 +159,12 @@ jobs:
         uses: github/codeql-action/upload-sarif@v3
         with: { sarif_file: snyk-iac.sarif, category: snyk-iac }
 
-      # Refresh the Snyk platform monitor (only meaningful if this repo is NOT
-      # SCM-imported; remove if it is, to avoid a duplicate project).
+      # Refreshes the Snyk platform monitor. Skip this if the repo is already
+      # SCM-imported on the platform side, otherwise you end up with a
+      # duplicate project.
       - name: Snyk monitor (code + deps baseline)
         run: snyk monitor --all-projects --remote-repo-url=${{ github.server_url }}/${{ github.repository }} || true
 
-      # The artifact scan the platform can never do.
       - name: Build image
         run: docker build -t nova-bank-goof:${{ github.sha }} .
       - name: Snyk Container test + monitor
