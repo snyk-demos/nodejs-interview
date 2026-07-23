@@ -1,26 +1,35 @@
 name: Snyk Scans
-# Drop-in caller for the Snyk scan templates. 
-#   - Feature branches: SCA, Code, and IaC run on every push, advisory, with
-#     sticky PR comments. The Snyk SCM integration owns
-#     PR checks, blocking (branch protection), and main-branch tracking.
-#   - Default branch: only the container scan runs (the image is built here and
-#     never exists in Git, so the SCM integration cannot cover it), and the
-#     image is snapshotted to Snyk with monitor.
+# Drop-in caller for the Snyk scan templates. Two triggers, no double runs:
+#   - push: every push to a feature branch runs SCA, Code, and IaC, advisory,
+#     with sticky PR comments (IaC included). A push to the default branch runs
+#     only the container scan (the image never exists in Git, so the Snyk SCM
+#     integration cannot cover it) and snapshots the image with monitor.
+#   - pull_request (opened/reopened/ready_for_review only): covers the gap
+#     where the branch was pushed before the PR existed, so the sticky comments
+#     appear as soon as the PR opens. synchronize is excluded on purpose: a
+#     push to a branch with an open PR already runs once via the push event.
+# Replace YOUR-ORG/snyk-scan-templates and pin a tag.
 on:
   push:
+  pull_request:
+    types: [opened, reopened, ready_for_review]
 
 permissions:
   contents: read
   pull-requests: write   # sticky PR comments
 
 concurrency:
-  group: snyk-${{ github.ref }}
+  group: snyk-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   sca:
     name: SCA
-    if: github.ref_name != github.event.repository.default_branch
+    # push to any non-default branch, or a same-repo PR opening.
+    # Fork PRs are excluded: they run without secrets, the scan cannot work.
+    if: >
+      (github.event_name == 'push' && github.ref_name != github.event.repository.default_branch) ||
+      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -38,7 +47,9 @@ jobs:
 
   code:
     name: Code
-    if: github.ref_name != github.event.repository.default_branch
+    if: >
+      (github.event_name == 'push' && github.ref_name != github.event.repository.default_branch) ||
+      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -48,7 +59,9 @@ jobs:
 
   iac:
     name: IaC
-    if: github.ref_name != github.event.repository.default_branch
+    if: >
+      (github.event_name == 'push' && github.ref_name != github.event.repository.default_branch) ||
+      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -58,11 +71,11 @@ jobs:
           # pr-comment defaults to "true": IaC results land on the open PR
           # as a sticky comment and in the run summary.
 
-  # Default branch only: build the release image, scan it, and snapshot it to
-  # the Snyk platform for ongoing tracking against new disclosures.
+  # Default-branch pushes only: build the release image, scan it, and snapshot
+  # it to the Snyk platform for ongoing tracking against new disclosures.
   container:
     name: Container
-    if: github.ref_name == github.event.repository.default_branch
+    if: github.event_name == 'push' && github.ref_name == github.event.repository.default_branch
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
