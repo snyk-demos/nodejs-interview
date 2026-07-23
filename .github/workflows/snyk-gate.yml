@@ -24,6 +24,9 @@ concurrency:
   cancel-in-progress: true
 env:
   SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+  # Same org as the baseline workflow, so test results, .snyk policies, and
+  # Snyk Code enablement match what the platform projects use.
+  SNYK_CFG_ORG: ${{ vars.SNYK_ORG }}
 jobs:
   gate:
     name: ${{ matrix.name }} Scan
