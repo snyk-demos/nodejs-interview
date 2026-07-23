@@ -1,0 +1,87 @@
+name: Snyk Gate
+
+# Fires ONLY on PRs targeting main/release.
+#
+# Use only instead of Snyk's native PR check, running both will cause double results.
+#
+# How the gating works: 
+# Every scan runs with continue-on-error and uploads its SARIF. 
+# GitHub Code Scanning is what diffs new findings against what's already known for the branch, 
+# and it's the code-scanning check that actually blocks the merge. 
+# Same mechanism for SCA, SAST, and IaC. No snyk-delta or baseline files to track.
+
+on:
+  pull_request:
+    branches: [ main, 'release/**' ]   # filters on the PR's TARGET branch
+
+permissions:
+  contents: read
+  security-events: write   # needed to upload SARIF to Code Scanning
+  # actions: read          # uncomment for PRIVATE repos, upload fails without it
+
+concurrency:
+  group: snyk-gate-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+jobs:
+  # SCA, SAST, and IaC run in parallel, each uploads its own SARIF under its
+  # own category. Code Scanning only shows NEW alerts on a PR, and branch
+  # protection requiring that check is what blocks the merge.
+  gate:
+    name: Snyk - Scan Gate | ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: SCA
+            command: snyk test
+            sarif: snyk-sca.sarif
+            category: snyk-sca
+            needs_deps: true
+          - name: SAST
+            command: snyk code test
+            sarif: snyk-code.sarif
+            category: snyk-code
+            needs_deps: false
+          - name: IaC
+            command: snyk iac test
+            sarif: snyk-iac.sarif
+            category: snyk-iac
+            needs_deps: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: 'npm'
+      - name: Install dependencies (SCA only)
+        if: matrix.needs_deps
+        run: npm install --ignore-scripts
+      - run: npm install -g snyk
+
+      # continue-on-error so findings (non-zero exit) don't skip the upload
+      # step. The SARIF output includes every severity, since Code Scanning
+      # needs the full picture to tell new from existing. The actual
+      # high/critical gate lives in the repo's code scanning config, not here.
+      - name: Scan ${{ matrix.name }}
+        continue-on-error: true
+        run: ${{ matrix.command }} --sarif-file-output=${{ matrix.sarif }}
+
+      # Not every product produces a file, IaC on a repo with no IaC files
+      # for example, so check before trying to upload.
+      - name: Check SARIF exists
+        id: sarif
+        run: |
+          if [ -f "${{ matrix.sarif }}" ]; then echo "found=true" >> "$GITHUB_OUTPUT";
+          else echo "found=false" >> "$GITHUB_OUTPUT"; echo "No SARIF for ${{ matrix.name }} (no supported files)."; fi
+
+      - name: Upload ${{ matrix.name }} to Code Scanning
+        if: steps.sarif.outputs.found == 'true'
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: ${{ matrix.sarif }}
+          category: ${{ matrix.category }}   # keep each product in its own category
