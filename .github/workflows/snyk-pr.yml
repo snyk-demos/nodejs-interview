@@ -66,8 +66,9 @@ jobs:
 
       # One report for all three, then a single sticky comment keyed on a hidden
       # marker so re-pushes edit in place instead of stacking new comments.
-      # Pushes with no open PR (or from a fork, which raises no push event here)
-      # fall through to the summary only.
+      # Nothing here is error-tolerant on purpose: a swallowed gh failure is
+      # indistinguishable from "no PR open", which makes a missing comment
+      # impossible to debug.
       - name: Report
         if: always()
         env:
@@ -84,19 +85,52 @@ jobs:
           render "Snyk IaC (high/critical only)"  iac.sarif  "${{ steps.iac.outputs.code }}"
           cat report.md >> "$GITHUB_STEP_SUMMARY"
 
-          pr=$(gh pr list --head "$GITHUB_REF_NAME" --state open \
-                 --json number --jq '.[0].number // empty') || pr=""
+          echo "Branch: $GITHUB_REF_NAME"
+          pr=$(gh pr list --head "$GITHUB_REF_NAME" --state open --json number --jq '.[0].number // empty')
           if [ -z "$pr" ]; then
-            echo "No open PR for $GITHUB_REF_NAME, summary only."
+            echo "::notice::No open PR with head $GITHUB_REF_NAME. Summary written, no comment posted."
             exit 0
           fi
+          echo "Decorating PR #$pr"
 
-          { echo "$MARK"; head -c 60000 report.md; } > comment.md
-          id=$(gh api "repos/${GH_REPO}/issues/${pr}/comments" --paginate \
-                 --jq "[.[] | select((.body // \"\") | startswith(\"$MARK\"))] | .[0].id // empty") || id=""
-
+          # Truncate to GitHub's comment ceiling without splitting a multibyte
+          # character: a byte-level cut can tear an emoji and the API rejects
+          # invalid UTF-8. (iconv -c also exits 1 on the torn tail, which under
+          # bash -e would kill this step, hence python.)
+          { echo "$MARK"
+            python3 -c "import sys; sys.stdout.write(open('report.md','rb').read()[:60000].decode('utf-8','ignore'))"
+          } > comment.md
+          # per_page=100 rather than --paginate: with --paginate the --jq filter
+          # runs once per page and emits one result per page, not one overall.
+          id=$(gh api "repos/${GH_REPO}/issues/${pr}/comments?per_page=100" \
+                 --jq "[.[] | select((.body // \"\") | startswith(\"$MARK\"))] | .[0].id // empty")
           if [ -n "$id" ]; then
-            gh api -X PATCH "repos/${GH_REPO}/issues/comments/${id}" -F body=@comment.md
+            echo "Updating existing comment $id"
+            gh api -X PATCH "repos/${GH_REPO}/issues/comments/${id}" -F body=@comment.md > /dev/null
           else
-            gh api "repos/${GH_REPO}/issues/${pr}/comments" -F body=@comment.md
+            echo "Creating new comment"
+            gh api "repos/${GH_REPO}/issues/${pr}/comments" -F body=@comment.md > /dev/null
           fi
+
+      # Red X on findings, by severity: --severity-threshold=high above means
+      # exit 1 happens only for high and critical, so anything lower stays green.
+      # This does not block a merge. Blocking is a branch protection decision:
+      # leave "Scan" out of the required status checks and the X is advisory.
+      - name: Fail on high or critical
+        if: always()
+        env:
+          SCA: ${{ steps.sca.outputs.code }}
+          SAST: ${{ steps.sast.outputs.code }}
+          IAC: ${{ steps.iac.outputs.code }}
+        run: |
+          fail=0
+          for pair in "SCA:$SCA" "SAST:$SAST" "IaC:$IAC"; do
+            name="${pair%%:*}"; code="${pair##*:}"
+            case "$code" in
+              1) echo "::error::$name found high or critical issues."; fail=1 ;;
+              2) echo "::error::$name scan errored, results are incomplete."; fail=1 ;;
+              *) echo "$name: clean or nothing to scan (exit ${code:-?})." ;;
+            esac
+          done
+          exit "$fail"
+
