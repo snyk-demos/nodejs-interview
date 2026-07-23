@@ -1,36 +1,29 @@
 name: Snyk Main
-# Default branch only, so this fires on a direct push or on a merge. This is the
-# only place anything reaches the Snyk platform, and the only place the
-# container scan exists: build -> test -> push -> monitor, so the scan sits
-# between build and publish.
-#
-# No --severity-threshold anywhere here. Feature branches filter to high and
-# critical for signal; the platform should hold the full picture.
+# Default branch only: the one place anything reaches the Snyk platform, and
+# the only home of the container scan (build -> test -> push -> monitor).
+# No severity thresholds here: the platform records everything.
 on:
   push:
     branches: [ main ]
   workflow_dispatch: {}
 permissions:
   contents: read
-  packages: write   # push the scanned image to GHCR
+  packages: write   # push image to GHCR
 concurrency:
   group: snyk-main
-  # Not cancelled: a run interrupted mid-push can leave a partial upload.
-  cancel-in-progress: false
+  cancel-in-progress: false   # don't interrupt a run mid-push
 env:
   SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
   SNYK_CFG_ORG: ${{ secrets.SNYK_ORG }}
-  # Every project below is pinned to this target, so the four scan types show up
-  # as four projects under one repo instead of scattering across targets.
+  # --remote-repo-url pins every project below to this repo target
   REPO_URL: ${{ github.server_url }}/${{ github.repository }}
 jobs:
   monitor:
     name: Scan and monitor
     runs-on: ubuntu-latest
     steps:
-      # Derived from repo metadata: ghcr.io/<owner>/<repo>. Set the IMAGE_NAME
-      # repo variable ONLY if this artifact ships somewhere other than GHCR.
-      # Lowercased because the Docker reference grammar rejects uppercase.
+      # ghcr.io/<owner>/<repo>, lowercased (Docker rejects uppercase).
+      # Set the IMAGE_NAME repo variable only if shipping outside GHCR.
       - name: Resolve image name
         id: img
         env:
@@ -38,21 +31,17 @@ jobs:
         run: |
           name="${OVERRIDE:-ghcr.io/${GITHUB_REPOSITORY}}"
           echo "name=${name,,}" >> "$GITHUB_OUTPUT"
-          echo "Image: ${name,,}"
 
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 18
           cache: 'npm'
-      # Pin via the SNYK_CLI_VERSION repo variable for reproducible runs.
       - run: npm install -g snyk@${{ vars.SNYK_CLI_VERSION || 'latest' }}
-      - run: npm install --ignore-scripts
+      - run: npm install --ignore-scripts   # snyk test needs node_modules
 
-      # --- Open source -----------------------------------------------------
-      # test and monitor are separate commands: test produces the findings file,
-      # monitor snapshots the dependency tree for continuous alerting.
-      # --project-name "package.json" matches SCM naming, not "goof".
+      # Exit codes: 0 clean, 1 findings, 2 error, 3 nothing to scan.
+      # Findings never fail this workflow; it records, the PR workflow judges.
       - name: SCA test
         id: sca
         continue-on-error: true
@@ -62,6 +51,8 @@ jobs:
           echo "code=$?" >> "$GITHUB_OUTPUT"
           exit 0
 
+      # Snapshot the dependency tree for continuous alerting.
+      # --project-name matches SCM-style naming instead of "goof" from the manifest.
       - name: SCA monitor
         continue-on-error: true
         run: |
@@ -70,11 +61,9 @@ jobs:
             --remote-repo-url="$REPO_URL" \
             --target-reference="${{ github.ref_name }}"
 
-      # --- Code and IaC ----------------------------------------------------
-      # Neither has a `monitor` verb; --report is the equivalent. It combines
-      # with --sarif-file-output, so one invocation both writes the local
-      # findings file and persists the project, rather than scanning twice.
-      # --report requires the token to hold View Project Ignores.
+      # Code and IaC have no monitor verb; --report is the equivalent and
+      # combines with the file output, so one run tests and persists.
+      # --report needs the token to hold View Project Ignores.
       - name: SAST test and report
         id: sast
         continue-on-error: true
@@ -100,10 +89,11 @@ jobs:
           echo "code=$?" >> "$GITHUB_OUTPUT"
           exit 0
 
-      # --- Container -------------------------------------------------------
       - name: Build image
         run: docker build -t "${{ steps.img.outputs.name }}:${{ github.sha }}" .
 
+      # --file=Dockerfile adds base-image upgrade advice;
+      # --exclude-node-modules: app deps are already covered by the SCA scan
       - name: Container test
         id: container
         continue-on-error: true
@@ -122,16 +112,14 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Only if the scan actually ran. Tighten to `== '0'` to make findings
-      # block publication; on this deliberately vulnerable repo that would mean
-      # never publishing.
+      # Push after the scan; skipped if it errored. Tighten to == '0' to make
+      # findings block publication.
       - name: Push image
         if: steps.container.outputs.code != '2'
         run: docker push "${{ steps.img.outputs.name }}:${{ github.sha }}"
 
-      # Scan target is image:sha, the immutable artifact that shipped. Project
-      # name is a stable label and holds neither the sha (one project per
-      # commit) nor the registry host (a move to ECR would orphan the project).
+      # Scan target is image:sha (the shipped artifact); project name is a
+      # stable label with no sha and no registry host.
       - name: Container monitor
         continue-on-error: true
         run: |
@@ -141,7 +129,6 @@ jobs:
             --remote-repo-url="$REPO_URL" \
             --target-reference="${{ github.ref_name }}"
 
-      # Summary only. There is no PR to decorate on the default branch.
       - name: Report
         if: always()
         run: |
