@@ -1,13 +1,6 @@
 name: Snyk
-# Fires ONLY on pushes to feature branches. Nothing else triggers this file,
-# so PR and baseline runs won't show a skipped job for it in the checks list.
-#
-# Non-blocking feedback for lower-level branches only. Renders a
-# per-tool markdown report into the job summary. No PR decoration here,
-# that belongs to the gate workflow. The PR gate is where issues block.
-#
-# NOTE: the report lives on the workflow run's Summary page (Actions tab ->
-# click the run). That is where GITHUB_STEP_SUMMARY renders, by design.
+# Feature-branch pushes only. Non-blocking, report renders on the run's
+# Summary page (that's where GITHUB_STEP_SUMMARY lives). The gate blocks.
 on:
   push:
     branches-ignore: [ main, 'release/**' ]
@@ -18,9 +11,7 @@ concurrency:
   cancel-in-progress: true
 env:
   SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-  # Same org as the baseline workflow, so test results, .snyk policies, and
-  # Snyk Code enablement match what the platform projects use.
-  SNYK_CFG_ORG: ${{ secrets.SNYK_ORG }}
+  SNYK_CFG_ORG: ${{ secrets.SNYK_ORG }}   # same org secret in all 3 workflows
 jobs:
   quick-scan:
     name: Scan
@@ -33,9 +24,7 @@ jobs:
           cache: 'npm'
       - run: npm install -g snyk
 
-      # IaC runs BEFORE npm install on purpose: with node_modules present,
-      # snyk iac tries to parse fixture/tsconfig JSON inside dependencies and
-      # spams SNYK-CLI-0012 parse errors.
+      # IaC before npm install so snyk iac doesn't parse node_modules
       - name: IaC Scan
         id: iac
         continue-on-error: true

@@ -1,12 +1,7 @@
 name: Snyk
-# Fires ONLY on PRs targeting main/release.
-#
-# Use only instead of Snyk's native PR check, running both will cause double results.
-#
-# How the gating works:
-# Every scan runs with continue-on-error and uploads its SARIF.
-# GitHub Code Scanning diffs new findings against the baseline for the target
-# branch, and the code-scanning check is what actually blocks the merge.
+# PR gate: scans upload SARIF, Code Scanning diffs new findings and blocks.
+# Each scan also renders a severity-grouped report to summary + sticky PR
+# comment. Don't run alongside Snyk's native PR check (double results).
 on:
   pull_request:
     branches: [ main, 'release/**' ]   # filters on the PR's TARGET branch
@@ -20,9 +15,7 @@ concurrency:
   cancel-in-progress: true
 env:
   SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-  # Same org as the other workflows, so test results, .snyk policies, and
-  # Snyk Code enablement match what the platform projects use.
-  SNYK_CFG_ORG: ${{ secrets.SNYK_ORG }}
+  SNYK_CFG_ORG: ${{ secrets.SNYK_ORG }}   # same org secret in all 3 workflows
 jobs:
   gate:
     name: ${{ matrix.name }} Scan
@@ -36,7 +29,6 @@ jobs:
             command: snyk test
             sarif: snyk-sca.sarif
             category: snyk-sca
-            # SCA also emits JSON, that's where remediation/upgrade advice lives
             extra_flags: --json-file-output=snyk-sca.json
             render_mode: sca
             render_file: snyk-sca.json
@@ -70,13 +62,7 @@ jobs:
         run: npm install --ignore-scripts
       - run: npm install -g snyk
 
-      # continue-on-error so findings (non-zero exit) don't skip the render and
-      # upload steps. SARIF carries every severity, Code Scanning needs the full
-      # picture to tell new from existing. The high/critical gate lives in the
-      # repo's code scanning config, not here.
-      # Snyk exit codes: 0 clean, 1 findings, 2 real error, 3 no supported
-      # files for this scan type. Only 2 should mark the step as failed, so
-      # a repo with no IaC (exit 3) doesn't show a red X on every PR.
+      # exit codes: 0 clean, 1 findings, 2 error, 3 nothing to scan; only 2 fails
       - name: Scan ${{ matrix.name }}
         id: scan
         continue-on-error: true
@@ -221,8 +207,6 @@ jobs:
           header: snyk-${{ matrix.name }}   # keeps each scan in its own sticky comment
           path: report.md
 
-      # Not every product produces a file, IaC on a repo with no IaC files
-      # for example, so check before trying to upload.
       - name: Check SARIF exists
         id: sarif
         if: always()
