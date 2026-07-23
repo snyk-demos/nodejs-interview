@@ -1,4 +1,4 @@
-name: Snyk Baseline
+name: Snyk 
 
 # Fires ONLY on pushes to a protected branch, plus manual runs.
 #
@@ -25,7 +25,7 @@ env:
 
 jobs:
   baseline:
-    name: Refresh
+    name: Baseline Refresh
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
