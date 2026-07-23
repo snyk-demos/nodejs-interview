@@ -1,15 +1,9 @@
 #!/usr/bin/env python3
 """Render a Snyk result file (SARIF or Snyk Open Source JSON) as Markdown.
 
-One renderer for all four scan types. Format is auto-detected from the
-payload, so SAST / IaC / Container (SARIF) and SCA (Snyk JSON) share a
-single implementation instead of four copies embedded in YAML heredocs.
-
-Environment:
-  RENDER_FILE   path to the results file                 (required)
-  RENDER_TITLE  optional H2 heading for the section
-  RENDER_EXIT   Snyk CLI exit code; 3 means nothing to scan
-  RENDER_OUT    markdown file to append to               (default report.md)
+Env: RENDER_FILE (results path), RENDER_TITLE (H2 heading), RENDER_EXIT
+(Snyk exit code, 3 = nothing to scan), RENDER_OUT (append target, default
+report.md). Format is auto-detected, one renderer for all four scan types.
 """
 import json
 import os
@@ -20,9 +14,7 @@ SEV_ICON = {"critical": "\U0001F6A8", "high": "\U0001F534",
 SEV_LABEL = {"critical": "Critical", "high": "High",
              "medium": "Medium", "low": "Low"}
 LEVEL_TO_SEV = {"error": "high", "warning": "medium", "note": "low"}
-# Every section collapsed. The severity table is the only thing visible until
-# someone chooses to expand a section.
-OPEN_BY_DEFAULT = set()
+OPEN_BY_DEFAULT = set()   # empty = all findings sections render collapsed
 LIMIT = 25
 
 
@@ -30,8 +22,7 @@ def load(path):
     try:
         with open(path) as f:
             d = json.load(f)
-        # snyk test on a multi-manifest repo emits a JSON array
-        return d[0] if isinstance(d, list) and d else d
+        return d[0] if isinstance(d, list) and d else d   # multi-manifest = array
     except Exception:
         return None
 
@@ -51,8 +42,7 @@ def bucket(items, key):
 
 
 def counts_table(prefix, by_sev):
-    """Headline plus a severity table. This is the only thing visible by
-    default; every findings section below it renders collapsed."""
+    """Headline plus the severity/count table shown above the collapsed sections."""
     rows = [prefix, "", "| Severity | Count |", "|---|---|"]
     for s in SEV_ORDER:
         if s in by_sev:
@@ -61,11 +51,7 @@ def counts_table(prefix, by_sev):
 
 
 def sarif_severity(result, rules):
-    """Prefer Snyk's own severity property; fall back to the SARIF level.
-
-    Container and IaC SARIF carry a real critical/high/medium/low; Snyk Code
-    only carries error/warning/note, which maps onto high/medium/low.
-    """
+    """Snyk's severity property when present (container/IaC), else the SARIF level."""
     for src in (result.get("properties") or {}, rules.get(result.get("ruleId"), {}).get("properties") or {}):
         sev = str(src.get("severity", "")).lower()
         if sev in SEV_LABEL:
