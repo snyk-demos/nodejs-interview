@@ -1,0 +1,62 @@
+name: Snyk Scans
+# Drop-in caller for the Snyk scan templates. 
+# Feature-branch pushes only:
+# the Snyk SCM integration owns PR checks, blocking (via branch protection),
+# and main-branch tracking; these jobs add visibility inside GitHub on every
+# push.
+on:
+  push:
+    branches-ignore: [ main ]
+permissions:
+  contents: read
+  pull-requests: write   # sticky PR comments
+concurrency:
+  group: snyk-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  sca:
+    name: SCA
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: 'npm'
+      - run: npm install --ignore-scripts   # snyk test needs resolved deps
+      - uses: snyk-demos/snyk-scan-templates/sca@v1
+        with:
+          snyk-token: ${{ secrets.SNYK_TOKEN }}
+          # fail-on-findings: "true"        # flip when this check should fail
+          # severity-threshold: critical    # what "fail" means, per scan
+
+  code:
+    name: Code
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: snyk-demos/snyk-scan-templates/code@v1
+        with:
+          snyk-token: ${{ secrets.SNYK_TOKEN }}
+
+  iac:
+    name: IaC
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: snyk-demos/snyk-scan-templates/iac@v1
+        with:
+          snyk-token: ${{ secrets.SNYK_TOKEN }}
+          pr-comment: "false"               # example: summary only, no comment
+
+  # Optional: only for repos that build an image. Build first, then scan.
+  container:
+    name: Container
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t local/app:${{ github.sha }} .
+      - uses: snyk-demos/snyk-scan-templates/container@v1
+        with:
+          snyk-token: ${{ secrets.SNYK_TOKEN }}
+          image: local/app:${{ github.sha }}
