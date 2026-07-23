@@ -8,7 +8,8 @@ on:
   workflow_dispatch: {}
 permissions:
   contents: read
-  checks: write   # publish the results check run
+  checks: write     # publish the results check run
+  packages: write   # push the scanned image to GHCR
 concurrency:
   group: snyk-container-${{ github.ref }}
   cancel-in-progress: false
@@ -39,6 +40,13 @@ jobs:
           node-version: 18
       # Pin via the SNYK_CLI_VERSION repo variable for reproducible runs.
       - run: npm install -g snyk@${{ vars.SNYK_CLI_VERSION || 'latest' }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build image
         run: docker build -t "${{ steps.img.outputs.name }}:${{ github.sha }}" .
@@ -91,6 +99,14 @@ jobs:
             -f conclusion="$conc" \
             -f "output[title]=Snyk Container Results" \
             -F "output[summary]=@check.md"
+
+      # Publish only after the scan ran. This is the whole point of scanning
+      # between build and push: the image address in the Snyk project is real
+      # and pullable, and a scan that errored (code 2) never ships.
+      # Tighten to `== '0'` if you want findings to block publication.
+      - name: Push image
+        if: steps.scan.outputs.code != '2'
+        run: docker push "${{ steps.img.outputs.name }}:${{ github.sha }}"
 
       # snyk container monitor: snapshot the image contents to the Snyk UI so
       # newly disclosed base-image and OS-package vulns raise alerts without a

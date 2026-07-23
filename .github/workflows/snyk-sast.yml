@@ -78,10 +78,15 @@ jobs:
       # Snyk Code has no `monitor` verb; --report is the equivalent and persists
       # the scan to the Snyk UI. No --severity-threshold, so the project records
       # every severity. Requires the token to hold View Project Ignores.
+      #   --project-name    "Code Scan" reads unambiguously next to the
+      #                     package.json project on the same target. Only the
+      #                     target disambiguates it across repos, hence the pin.
+      #   --remote-repo-url pins the target to this repo.
       - name: SAST monitor (--report)
         if: github.ref_name == github.event.repository.default_branch || startsWith(github.ref_name, 'release/')
         continue-on-error: true
         run: |
           snyk code test --report \
-            --project-name="${{ github.event.repository.name }}" \
+            --project-name="Code Scan" \
+            --remote-repo-url="${{ github.server_url }}/${{ github.repository }}" \
             --target-reference="${{ github.ref_name }}"

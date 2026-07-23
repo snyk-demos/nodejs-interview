@@ -79,9 +79,17 @@ jobs:
       # snyk monitor: snapshot the dependency tree to the Snyk UI for continuous
       # monitoring, so newly disclosed vulns raise alerts without a new commit.
       # No --severity-threshold: monitor should record the full picture.
-      # No --project-name: Snyk derives it from the manifest, which keeps the
-      # project stable across runs. --target-reference groups snapshots by branch.
+      #   --project-name    "package.json", matching how the SCM integration
+      #                     names projects, instead of "goof" from the manifest.
+      #   --remote-repo-url pins the target to this repo so the CLI project sits
+      #                     under snyk-demos/nodejs-interview rather than
+      #                     inventing a second target from the git remote.
+      #   --target-reference groups snapshots by branch.
       - name: SCA monitor
         if: github.ref_name == github.event.repository.default_branch || startsWith(github.ref_name, 'release/')
         continue-on-error: true
-        run: snyk monitor --target-reference="${{ github.ref_name }}"
+        run: |
+          snyk monitor \
+            --project-name="package.json" \
+            --remote-repo-url="${{ github.server_url }}/${{ github.repository }}" \
+            --target-reference="${{ github.ref_name }}"
