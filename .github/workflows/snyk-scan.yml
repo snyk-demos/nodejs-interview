@@ -1,25 +1,22 @@
-name: Snyk 
-
+name: Snyk
 # Fires ONLY on pushes to feature branches. Nothing else triggers this file,
 # so PR and baseline runs won't show a skipped job for it in the checks list.
 #
-# Fast, non-blocking feedback. Dumps results into the job summary so devs
-# don't have to dig through logs. The PR gate is where issues actually block.
-
+# Fast, non-blocking feedback. Renders a per-tool markdown report into the job
+# summary, and if the branch already has an open PR (found via the GitHub API
+# with gh), posts the same report as a single sticky comment on it.
+# The PR gate is where issues actually block.
 on:
   push:
     branches-ignore: [ main, 'release/**' ]
-
 permissions:
-  contents: read          # no SARIF upload here, so nothing else is needed
-
+  contents: read
+  pull-requests: write   # needed to find the open PR and post/update the sticky comment
 concurrency:
   group: snyk-quick-${{ github.ref }}
   cancel-in-progress: true
-
 env:
   SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-
 jobs:
   quick-scan:
     name: Scan
@@ -30,15 +27,138 @@ jobs:
         with:
           node-version: 18
           cache: 'npm'
-      - run: npm install --ignore-scripts
       - run: npm install -g snyk
 
-      - name: Quick SCA + SAST + IaC (high/critical, non-blocking)
+      # IaC runs BEFORE npm install on purpose: with node_modules present,
+      # snyk iac tries to parse fixture/tsconfig JSON inside dependencies and
+      # spams SNYK-CLI-0012 parse errors.
+      - name: IaC quick scan
+        continue-on-error: true
+        run: snyk iac test --severity-threshold=high --sarif-file-output=iac.sarif
+
+      - run: npm install --ignore-scripts
+
+      - name: SCA quick scan
+        continue-on-error: true
+        run: snyk test --severity-threshold=high --json-file-output=sca.json
+
+      - name: SAST quick scan
+        continue-on-error: true
+        run: snyk code test --severity-threshold=high --sarif-file-output=code.sarif
+
+      - name: Write report renderer
+        if: always()
         run: |
-          echo "## Snyk quick scan" >> "$GITHUB_STEP_SUMMARY"
-          echo "Fast feedback only. The PR gate is where issues block." >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          snyk test        --severity-threshold=high 2>&1 | tee -a "$GITHUB_STEP_SUMMARY" || true
-          snyk code test   --severity-threshold=high 2>&1 | tee -a "$GITHUB_STEP_SUMMARY" || true
-          snyk iac test    --severity-threshold=high 2>&1 | tee -a "$GITHUB_STEP_SUMMARY" || true
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat > render.py << 'EOF'
+          import json, os
+
+          SEV_ICON = {"critical": "\U0001F6A8 Critical", "high": "\U0001F534 High", "medium": "\U0001F7E0 Medium", "low": "\U0001F7E1 Low"}
+          LEVEL_MAP = {"error": "\U0001F534 High", "warning": "\U0001F7E0 Medium", "note": "\U0001F7E1 Low"}
+          LEVEL_RANK = {"error": 0, "warning": 1, "note": 2}
+
+          def load(path):
+              try:
+                  with open(path) as f:
+                      d = json.load(f)
+                  return d[0] if isinstance(d, list) and d else d
+              except Exception:
+                  return None
+
+          def render_sca(path):
+              d = load(path)
+              if not d:
+                  return ["\u26A0\uFE0F Scan produced no output. Check the step log (auth error or unsupported project)."]
+              vulns = d.get("vulnerabilities") or []
+              if not vulns:
+                  return ["\u2705 No high/critical dependency issues."]
+              counts = {}
+              for v in vulns:
+                  s = v.get("severity", "unknown")
+                  counts[s] = counts.get(s, 0) + 1
+              unique = d.get("uniqueCount", len(vulns))
+              parts = " | ".join(f"{SEV_ICON.get(s, s)}: {counts[s]}" for s in ("critical", "high", "medium", "low") if s in counts)
+              out = [f"**{unique} unique issues across {len(vulns)} vulnerable paths** | {parts}", ""]
+              upgrades = (d.get("remediation") or {}).get("upgrade") or {}
+              if upgrades:
+                  out += ["**Top fixes by impact** (bump these first):", "", "| Upgrade | To | Fixes |", "|---|---|---|"]
+                  ranked = sorted(upgrades.items(), key=lambda kv: -len(kv[1].get("vulns", [])))
+                  for pkg, info in ranked[:10]:
+                      out.append(f"| `{pkg}` | `{info.get('upgradeTo','?')}` | {len(info.get('vulns', []))} issues |")
+                  if len(ranked) > 10:
+                      out += ["", f"...plus {len(ranked)-10} more upgrades, see the run log."]
+              unresolved = (d.get("remediation") or {}).get("unresolved") or []
+              if unresolved:
+                  out += ["", f"\u26A0\uFE0F {len(unresolved)} issues have **no direct upgrade** (transitive pins), see run log for fixed-in versions."]
+              return out
+
+          def render_sarif(path, limit=15):
+              d = load(path)
+              if not d:
+                  return ["\u26A0\uFE0F Scan produced no output. Check the step log (auth/enablement error or no supported files)."]
+              run = (d.get("runs") or [{}])[0]
+              rules = {r.get("id"): (r.get("shortDescription") or {}).get("text") or r.get("id")
+                       for r in ((run.get("tool") or {}).get("driver") or {}).get("rules", [])}
+              results = run.get("results") or []
+              if not results:
+                  return ["\u2705 No findings."]
+              counts = {}
+              for r in results:
+                  l = r.get("level", "warning")
+                  counts[l] = counts.get(l, 0) + 1
+              parts = " | ".join(f"{LEVEL_MAP.get(l, l)}: {counts[l]}" for l in ("error", "warning", "note") if l in counts)
+              out = [f"**{len(results)} findings** | {parts}", "", "| Severity | Issue | Location |", "|---|---|---|"]
+              results = sorted(results, key=lambda r: LEVEL_RANK.get(r.get("level"), 9))
+              for r in results[:limit]:
+                  loc = ((r.get("locations") or [{}])[0].get("physicalLocation") or {})
+                  uri = (loc.get("artifactLocation") or {}).get("uri", "?")
+                  line = (loc.get("region") or {}).get("startLine", "?")
+                  out.append(f"| {LEVEL_MAP.get(r.get('level'), r.get('level'))} | {rules.get(r.get('ruleId'), r.get('ruleId'))} | `{uri}:{line}` |")
+              if len(results) > limit:
+                  out += ["", f"...plus {len(results)-limit} more, see the run log."]
+              return out
+
+          def main():
+              mode = os.environ.get("RENDER_MODE", "sarif")
+              src = os.environ["RENDER_FILE"]
+              title = os.environ.get("RENDER_TITLE", "")
+              lines = ([f"### {title}", ""] if title else [])
+              lines += render_sca(src) if mode == "sca" else render_sarif(src)
+              lines.append("")
+              with open(os.environ.get("RENDER_OUT", "report.md"), "a", encoding="utf-8") as f:
+                  f.write("\n".join(lines) + "\n")
+
+          main()
+          EOF
+
+      - name: Build quick-scan report
+        if: always()
+        run: |
+          {
+            echo "## 🔍 Snyk quick scan (high/critical only)"
+            echo "_Fast, non-blocking feedback on \`${GITHUB_REF_NAME}\`. The PR gate is where issues block._"
+            echo ""
+          } > report.md
+          RENDER_MODE=sca   RENDER_FILE=sca.json    RENDER_TITLE="SCA (open-source dependencies)" python3 render.py
+          RENDER_MODE=sarif RENDER_FILE=code.sarif  RENDER_TITLE="SAST (Snyk Code)"               python3 render.py
+          RENDER_MODE=sarif RENDER_FILE=iac.sarif   RENDER_TITLE="IaC"                            python3 render.py
+          cat report.md >> "$GITHUB_STEP_SUMMARY"
+
+      # Push events carry no PR context, so ask the GitHub API whether this
+      # branch has an open PR and decorate it too if so.
+      - name: Find open PR for this branch
+        id: pr
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          num=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$GITHUB_REF_NAME" --state open --json number --jq '.[0].number // empty')
+          echo "number=$num" >> "$GITHUB_OUTPUT"
+          [ -n "$num" ] && echo "Found open PR #$num" || echo "No open PR for this branch, summary only."
+
+      - name: PR comment (quick scan)
+        if: always() && steps.pr.outputs.number != ''
+        uses: marocchino/sticky-pull-request-comment@v3
+        with:
+          header: snyk-quick
+          number: ${{ steps.pr.outputs.number }}
+          path: report.md

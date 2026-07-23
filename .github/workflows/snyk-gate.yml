@@ -1,35 +1,30 @@
-name: Snyk 
-
+name: Snyk
 # Fires ONLY on PRs targeting main/release.
 #
 # Use only instead of Snyk's native PR check, running both will cause double results.
 #
-# How the gating works: 
-# Every scan runs with continue-on-error and uploads its SARIF. 
-# GitHub Code Scanning is what diffs new findings against what's already known for the branch, 
-# and it's the code-scanning check that actually blocks the merge. 
-# Same mechanism for SCA, SAST, and IaC. No snyk-delta or baseline files to track.
-
+# How the gating works:
+# Every scan runs with continue-on-error and uploads its SARIF.
+# GitHub Code Scanning diffs new findings against the baseline for the target
+# branch, and the code-scanning check is what actually blocks the merge.
+#
+# Decorations: each matrix leg renders a markdown report (severity counts,
+# top fixes, finding table) into the job summary AND a sticky PR comment.
+# One comment per scan type, updated in place on every push, no comment spam.
 on:
   pull_request:
     branches: [ main, 'release/**' ]   # filters on the PR's TARGET branch
-
 permissions:
   contents: read
-  security-events: write   # needed to upload SARIF to Code Scanning
+  security-events: write   # SARIF upload to Code Scanning
+  pull-requests: write     # sticky PR comments
   # actions: read          # uncomment for PRIVATE repos, upload fails without it
-
 concurrency:
   group: snyk-gate-${{ github.ref }}
   cancel-in-progress: true
-
 env:
   SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-
 jobs:
-  # SCA, SAST, and IaC run in parallel, each uploads its own SARIF under its
-  # own category. Code Scanning only shows NEW alerts on a PR, and branch
-  # protection requiring that check is what blocks the merge.
   gate:
     name: ${{ matrix.name }} Scan
     runs-on: ubuntu-latest
@@ -38,19 +33,32 @@ jobs:
       matrix:
         include:
           - name: SCA
+            title: SCA (open-source dependencies)
             command: snyk test
             sarif: snyk-sca.sarif
             category: snyk-sca
+            # SCA also emits JSON, that's where remediation/upgrade advice lives
+            extra_flags: --json-file-output=snyk-sca.json
+            render_mode: sca
+            render_file: snyk-sca.json
             needs_deps: true
           - name: SAST
+            title: SAST (Snyk Code)
             command: snyk code test
             sarif: snyk-code.sarif
             category: snyk-code
+            extra_flags: ''
+            render_mode: sarif
+            render_file: snyk-code.sarif
             needs_deps: false
           - name: IaC
+            title: IaC (Terraform/K8s/CloudFormation)
             command: snyk iac test
             sarif: snyk-iac.sarif
             category: snyk-iac
+            extra_flags: ''
+            render_mode: sarif
+            render_file: snyk-iac.sarif
             needs_deps: false
     steps:
       - uses: actions/checkout@v4
@@ -63,24 +71,131 @@ jobs:
         run: npm install --ignore-scripts
       - run: npm install -g snyk
 
-      # continue-on-error so findings (non-zero exit) don't skip the upload
-      # step. The SARIF output includes every severity, since Code Scanning
-      # needs the full picture to tell new from existing. The actual
-      # high/critical gate lives in the repo's code scanning config, not here.
+      # continue-on-error so findings (non-zero exit) don't skip the render and
+      # upload steps. SARIF carries every severity, Code Scanning needs the full
+      # picture to tell new from existing. The high/critical gate lives in the
+      # repo's code scanning config, not here.
       - name: Scan ${{ matrix.name }}
         continue-on-error: true
-        run: ${{ matrix.command }} --sarif-file-output=${{ matrix.sarif }}
+        run: ${{ matrix.command }} --sarif-file-output=${{ matrix.sarif }} ${{ matrix.extra_flags }}
+
+      - name: Write report renderer
+        if: always()
+        run: |
+          cat > render.py << 'EOF'
+          import json, os
+
+          SEV_ICON = {"critical": "\U0001F6A8 Critical", "high": "\U0001F534 High", "medium": "\U0001F7E0 Medium", "low": "\U0001F7E1 Low"}
+          LEVEL_MAP = {"error": "\U0001F534 High", "warning": "\U0001F7E0 Medium", "note": "\U0001F7E1 Low"}
+          LEVEL_RANK = {"error": 0, "warning": 1, "note": 2}
+
+          def load(path):
+              try:
+                  with open(path) as f:
+                      d = json.load(f)
+                  return d[0] if isinstance(d, list) and d else d
+              except Exception:
+                  return None
+
+          def render_sca(path):
+              d = load(path)
+              if not d:
+                  return ["\u26A0\uFE0F Scan produced no output. Check the step log (auth error or unsupported project)."]
+              vulns = d.get("vulnerabilities") or []
+              if not vulns:
+                  return ["\u2705 No dependency issues at or above the configured threshold."]
+              counts = {}
+              for v in vulns:
+                  s = v.get("severity", "unknown")
+                  counts[s] = counts.get(s, 0) + 1
+              unique = d.get("uniqueCount", len(vulns))
+              parts = " | ".join(f"{SEV_ICON.get(s, s)}: {counts[s]}" for s in ("critical", "high", "medium", "low") if s in counts)
+              out = [f"**{unique} unique issues across {len(vulns)} vulnerable paths** | {parts}", ""]
+              upgrades = (d.get("remediation") or {}).get("upgrade") or {}
+              if upgrades:
+                  out += ["**Top fixes by impact** (bump these first):", "", "| Upgrade | To | Fixes |", "|---|---|---|"]
+                  ranked = sorted(upgrades.items(), key=lambda kv: -len(kv[1].get("vulns", [])))
+                  for pkg, info in ranked[:10]:
+                      out.append(f"| `{pkg}` | `{info.get('upgradeTo','?')}` | {len(info.get('vulns', []))} issues |")
+                  if len(ranked) > 10:
+                      out += ["", f"...plus {len(ranked)-10} more upgrades, see the run log."]
+              unresolved = (d.get("remediation") or {}).get("unresolved") or []
+              if unresolved:
+                  out += ["", f"\u26A0\uFE0F {len(unresolved)} issues have **no direct upgrade** (transitive pins), see run log for fixed-in versions."]
+              return out
+
+          def render_sarif(path, limit=15):
+              d = load(path)
+              if not d:
+                  return ["\u26A0\uFE0F Scan produced no output. Check the step log (auth/enablement error or no supported files)."]
+              run = (d.get("runs") or [{}])[0]
+              rules = {r.get("id"): (r.get("shortDescription") or {}).get("text") or r.get("id")
+                       for r in ((run.get("tool") or {}).get("driver") or {}).get("rules", [])}
+              results = run.get("results") or []
+              if not results:
+                  return ["\u2705 No findings."]
+              counts = {}
+              for r in results:
+                  l = r.get("level", "warning")
+                  counts[l] = counts.get(l, 0) + 1
+              parts = " | ".join(f"{LEVEL_MAP.get(l, l)}: {counts[l]}" for l in ("error", "warning", "note") if l in counts)
+              out = [f"**{len(results)} findings** | {parts}", "", "| Severity | Issue | Location |", "|---|---|---|"]
+              results = sorted(results, key=lambda r: LEVEL_RANK.get(r.get("level"), 9))
+              for r in results[:limit]:
+                  loc = ((r.get("locations") or [{}])[0].get("physicalLocation") or {})
+                  uri = (loc.get("artifactLocation") or {}).get("uri", "?")
+                  line = (loc.get("region") or {}).get("startLine", "?")
+                  out.append(f"| {LEVEL_MAP.get(r.get('level'), r.get('level'))} | {rules.get(r.get('ruleId'), r.get('ruleId'))} | `{uri}:{line}` |")
+              if len(results) > limit:
+                  out += ["", f"...plus {len(results)-limit} more, see the Security tab or run log."]
+              return out
+
+          def main():
+              mode = os.environ.get("RENDER_MODE", "sarif")
+              src = os.environ["RENDER_FILE"]
+              title = os.environ.get("RENDER_TITLE", "")
+              lines = ([f"### {title}", ""] if title else [])
+              lines += render_sca(src) if mode == "sca" else render_sarif(src)
+              lines.append("")
+              with open(os.environ.get("RENDER_OUT", "report.md"), "a", encoding="utf-8") as f:
+                  f.write("\n".join(lines) + "\n")
+
+          main()
+          EOF
+
+      - name: Build ${{ matrix.name }} report (summary + comment body)
+        if: always()
+        env:
+          RENDER_MODE: ${{ matrix.render_mode }}
+          RENDER_FILE: ${{ matrix.render_file }}
+          RENDER_TITLE: ${{ matrix.title }}
+          RENDER_OUT: report.md
+        run: |
+          python3 render.py
+          {
+            echo "_Merge blocking is enforced by the required Code Scanning check (new findings only)._"
+            echo "_Full results: **Security tab → Code scanning**, category \`${{ matrix.category }}\`._"
+          } >> report.md
+          cat report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: PR comment (${{ matrix.name }})
+        if: always()
+        uses: marocchino/sticky-pull-request-comment@v3
+        with:
+          header: snyk-${{ matrix.name }}   # keeps each scan in its own sticky comment
+          path: report.md
 
       # Not every product produces a file, IaC on a repo with no IaC files
       # for example, so check before trying to upload.
       - name: Check SARIF exists
         id: sarif
+        if: always()
         run: |
           if [ -f "${{ matrix.sarif }}" ]; then echo "found=true" >> "$GITHUB_OUTPUT";
           else echo "found=false" >> "$GITHUB_OUTPUT"; echo "No SARIF for ${{ matrix.name }} (no supported files)."; fi
 
       - name: Upload ${{ matrix.name }} to Code Scanning
-        if: steps.sarif.outputs.found == 'true'
+        if: always() && steps.sarif.outputs.found == 'true'
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: ${{ matrix.sarif }}
