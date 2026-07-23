@@ -30,17 +30,17 @@ jobs:
       # IaC runs BEFORE npm install on purpose: with node_modules present,
       # snyk iac tries to parse fixture/tsconfig JSON inside dependencies and
       # spams SNYK-CLI-0012 parse errors.
-      - name: IaC quick scan
+      - name: IaC Scan
         continue-on-error: true
         run: snyk iac test --severity-threshold=high --sarif-file-output=iac.sarif
 
       - run: npm install --ignore-scripts
 
-      - name: SCA quick scan
+      - name: SCA Scan
         continue-on-error: true
         run: snyk test --severity-threshold=high --json-file-output=sca.json
 
-      - name: SAST quick scan
+      - name: SAST Scan
         continue-on-error: true
         run: snyk code test --severity-threshold=high --sarif-file-output=code.sarif
 
@@ -128,7 +128,7 @@ jobs:
           main()
           EOF
 
-      - name: Build quick-scan report
+      - name: Build scan report
         if: always()
         run: |
           {
