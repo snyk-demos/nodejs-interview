@@ -1,10 +1,13 @@
 name: Snyk IaC
-# Feature-branch pushes only (never pull_request; the repo integration owns
-# PR diffing and blocking). Decorated, non-blocking feedback: run summary
-# plus a "IaC Results" check whose Details page shows the report directly.
+# snyk iac test runs on every branch: decorated, non-blocking feedback via the
+# run summary plus a "Snyk IaC Results" check whose Details page shows the
+# report. On the default and release branches the scan is re-run with --report,
+# which is the IaC equivalent of snyk monitor: it persists findings to the Snyk
+# UI as a project. Never pull_request; the SCM integration owns PR diffing.
 on:
   push:
-    branches-ignore: [ main, 'release/**' ]
+    branches: [ '**' ]
+  workflow_dispatch: {}
 permissions:
   contents: read
   checks: write   # publish the results check run
@@ -24,10 +27,11 @@ jobs:
         with:
           node-version: 18
           cache: 'npm'
-      - run: npm install -g snyk
+      # Pin via the SNYK_CLI_VERSION repo variable for reproducible runs.
+      - run: npm install -g snyk@${{ vars.SNYK_CLI_VERSION || 'latest' }}
 
       # exit codes: 0 clean, 1 findings, 2 error, 3 nothing to scan; only 2 fails
-      - name: IaC scan
+      - name: IaC test
         id: scan
         continue-on-error: true
         run: |
@@ -37,6 +41,7 @@ jobs:
           echo "code=$code" >> "$GITHUB_OUTPUT"
           if [ "$code" -eq 2 ]; then exit 2; fi
           exit 0
+
       - name: Report
         if: always()
         env:
@@ -45,72 +50,11 @@ jobs:
           RENDER_EXIT: ${{ steps.scan.outputs.code }}
           RENDER_OUT: report.md
         run: |
-          cat > render.py << 'EOF'
-          import json, os
-          SEV_ORDER = ["critical", "high", "medium", "low"]
-          SEV_ICON = {"critical": "\U0001F6A8", "high": "\U0001F534", "medium": "\U0001F7E0", "low": "\U0001F7E1"}
-          SEV_LABEL = {"critical": "Critical", "high": "High", "medium": "Medium", "low": "Low"}
-          LEVEL_TO_SEV = {"error": "high", "warning": "medium", "note": "low"}
-          OPEN_BY_DEFAULT = {"critical", "high"}
-          
-          def load(path):
-              try:
-                  with open(path) as f:
-                      d = json.load(f)
-                  return d[0] if isinstance(d, list) and d else d
-              except Exception:
-                  return None
-          
-          def details_block(sev, count, rows):
-              o = " open" if sev in OPEN_BY_DEFAULT else ""
-              return [f"<details{o}>", f"<summary>{SEV_ICON[sev]} <b>{SEV_LABEL[sev]}</b>: {count} issue(s)</summary>", ""] + rows + ["", "</details>", ""]
-          
-          def render(path, limit=25):
-              d = load(path)
-              if not d:
-                  return ["\u26A0\uFE0F Scan produced no output. Check the step log."]
-              run = (d.get("runs") or [{}])[0]
-              rules = {r.get("id"): (r.get("shortDescription") or {}).get("text") or r.get("id")
-                       for r in ((run.get("tool") or {}).get("driver") or {}).get("rules", [])}
-              results = run.get("results") or []
-              if not results:
-                  return ["\u2705 No findings."]
-              by_sev = {}
-              for r in results:
-                  by_sev.setdefault(LEVEL_TO_SEV.get(r.get("level"), "low"), []).append(r)
-              parts = " | ".join(f"{SEV_ICON[s]} {SEV_LABEL[s]}: {len(by_sev[s])}" for s in SEV_ORDER if s in by_sev)
-              out = [f"**{len(results)} findings** | {parts}", ""]
-              for sev in SEV_ORDER:
-                  if sev not in by_sev:
-                      continue
-                  rows = ["| Issue | Location |", "|---|---|"]
-                  for r in by_sev[sev][:limit]:
-                      loc = ((r.get("locations") or [{}])[0].get("physicalLocation") or {})
-                      uri = (loc.get("artifactLocation") or {}).get("uri", "?")
-                      line = (loc.get("region") or {}).get("startLine", "?")
-                      rows.append(f"| {rules.get(r.get('ruleId'), r.get('ruleId'))} | `{uri}:{line}` |")
-                  if len(by_sev[sev]) > limit:
-                      rows += ["", f"...plus {len(by_sev[sev])-limit} more, see the run log."]
-                  out += details_block(sev, len(by_sev[sev]), rows)
-              return out
-          
-          def main():
-              title = os.environ.get("RENDER_TITLE", "")
-              lines = ([f"## {title}", ""] if title else [])
-              if os.environ.get("RENDER_EXIT") == "3":
-                  lines += ["\u2139\uFE0F No supported files for this scan type in the repo, nothing to scan."]
-              else:
-                  lines += render(os.environ["RENDER_FILE"])
-              lines.append("")
-              with open(os.environ.get("RENDER_OUT", "report.md"), "a", encoding="utf-8") as f:
-                  f.write("\n".join(lines) + "\n")
-          
-          main()
-          EOF
-          python3 render.py
+          python3 .github/scripts/render.py
           cat report.md >> "$GITHUB_STEP_SUMMARY"
-      # Check Run "Snyk IaC Results": its Details page renders the report directly,
-      # no digging through logs. neutral = findings, informational only.
+
+      # Check Run "Snyk IaC Results": its Details page renders the report
+      # directly, no digging through logs. neutral = findings, informational.
       - name: Publish results check
         if: always()
         env:
@@ -130,3 +74,13 @@ jobs:
             -f conclusion="$conc" \
             -f "output[title]=Snyk IaC Results" \
             -F "output[summary]=@check.md"
+
+      # IaC has no `monitor` verb; --report is the equivalent and persists the
+      # scan to the Snyk UI. Skipped when the previous step found nothing to
+      # scan (exit 3), because --report on an empty repo is a wasted call.
+      - name: IaC monitor (--report)
+        if: |
+          steps.scan.outputs.code != '3' &&
+          (github.ref_name == github.event.repository.default_branch || startsWith(github.ref_name, 'release/'))
+        continue-on-error: true
+        run: snyk iac test --report --target-reference="${{ github.ref_name }}"
