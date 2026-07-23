@@ -1,6 +1,8 @@
 name: Snyk PR
-# All branches except main: SCA + SAST + IaC, one combined report to the run
-# summary and a sticky PR comment. Nothing goes to the Snyk platform.
+# All branches except main. Three parallel jobs (SCA, SAST, IaC), each with its
+# own pass/fail check and its own sticky PR comment; fails on high/critical or
+# a scan error. Nothing goes to the Snyk platform. (New-issues-only gating is
+# the platform PR check's native job; this pipeline does not re-implement it.)
 # Push-triggered (not pull_request) so an open PR doesn't run everything twice.
 on:
   push:
@@ -8,7 +10,7 @@ on:
   workflow_dispatch: {}
 permissions:
   contents: read
-  pull-requests: write   # sticky PR comment
+  pull-requests: write   # sticky PR comments
 concurrency:
   group: snyk-pr-${{ github.ref }}
   cancel-in-progress: true
@@ -16,8 +18,8 @@ env:
   SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
   SNYK_CFG_ORG: ${{ secrets.SNYK_ORG }}
 jobs:
-  scan:
-    name: Scan
+  sca:
+    name: SCA
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -27,90 +29,46 @@ jobs:
           cache: 'npm'
       - run: npm install -g snyk@${{ vars.SNYK_CLI_VERSION || 'latest' }}
       - run: npm install --ignore-scripts   # snyk test needs node_modules
+      - uses: ./.github/actions/snyk-scan
+        with:
+          scan-name: SCA
+          scan-cmd: snyk test
+          output-flag: --json-file-output
+          results-file: sca.json
+          marker: snyk-sca
 
-      # Exit codes: 0 clean, 1 findings, 2 error, 3 nothing to scan.
-      # Each scan captures its code and exits 0 so all three always run;
-      # the last step turns the codes into pass/fail.
-      # --severity-threshold=high: exit 1 only for high/critical.
-      - name: SCA test
-        id: sca
-        continue-on-error: true
-        run: |
-          set +e
-          snyk test --severity-threshold=high --json-file-output=sca.json
-          echo "code=$?" >> "$GITHUB_OUTPUT"
-          exit 0
+  sast:
+    name: SAST
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: 'npm'
+      - run: npm install -g snyk@${{ vars.SNYK_CLI_VERSION || 'latest' }}
+      - uses: ./.github/actions/snyk-scan
+        with:
+          scan-name: SAST
+          scan-cmd: snyk code test
+          output-flag: --sarif-file-output
+          results-file: sast.sarif
+          marker: snyk-sast
 
-      - name: SAST test
-        id: sast
-        continue-on-error: true
-        run: |
-          set +e
-          snyk code test --severity-threshold=high --sarif-file-output=sast.sarif
-          echo "code=$?" >> "$GITHUB_OUTPUT"
-          exit 0
-
-      - name: IaC test
-        id: iac
-        continue-on-error: true
-        run: |
-          set +e
-          snyk iac test --severity-threshold=high --sarif-file-output=iac.sarif
-          echo "code=$?" >> "$GITHUB_OUTPUT"
-          exit 0
-
-      # Render all three into report.md, write the run summary, then upsert one
-      # PR comment keyed on the hidden MARK so re-pushes edit it in place.
-      - name: Report
-        if: always()
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          MARK: <!-- snyk-pr -->
-        run: |
-          render() {
-            RENDER_TITLE="$1" RENDER_FILE="$2" RENDER_EXIT="$3" RENDER_OUT=report.md \
-              python3 .github/scripts/render.py
-          }
-          render "Snyk SCA (high/critical only)"  sca.json   "${{ steps.sca.outputs.code }}"
-          render "Snyk SAST (high/critical only)" sast.sarif "${{ steps.sast.outputs.code }}"
-          render "Snyk IaC (high/critical only)"  iac.sarif  "${{ steps.iac.outputs.code }}"
-          cat report.md >> "$GITHUB_STEP_SUMMARY"
-
-          pr=$(gh pr list --head "$GITHUB_REF_NAME" --state open --json number --jq '.[0].number // empty')
-          if [ -z "$pr" ]; then
-            echo "::notice::No open PR with head $GITHUB_REF_NAME. Summary only."
-            exit 0
-          fi
-
-          # python truncation: byte-cut can tear an emoji into invalid UTF-8
-          { echo "$MARK"
-            python3 -c "import sys; sys.stdout.write(open('report.md','rb').read()[:60000].decode('utf-8','ignore'))"
-          } > comment.md
-          id=$(gh api "repos/${GH_REPO}/issues/${pr}/comments?per_page=100" \
-                 --jq "[.[] | select((.body // \"\") | startswith(\"$MARK\"))] | .[0].id // empty")
-          if [ -n "$id" ]; then
-            gh api -X PATCH "repos/${GH_REPO}/issues/comments/${id}" -F body=@comment.md > /dev/null
-          else
-            gh api "repos/${GH_REPO}/issues/${pr}/comments" -F body=@comment.md > /dev/null
-          fi
-
-      # Red X if any scan found high/critical (1) or errored (2). Advisory
-      # unless "Scan" is added to required status checks in branch protection.
-      - name: Fail on high or critical
-        if: always()
-        env:
-          SCA: ${{ steps.sca.outputs.code }}
-          SAST: ${{ steps.sast.outputs.code }}
-          IAC: ${{ steps.iac.outputs.code }}
-        run: |
-          fail=0
-          for pair in "SCA:$SCA" "SAST:$SAST" "IaC:$IAC"; do
-            name="${pair%%:*}"; code="${pair##*:}"
-            case "$code" in
-              1) echo "::error::$name found high or critical issues."; fail=1 ;;
-              2) echo "::error::$name scan errored, results are incomplete."; fail=1 ;;
-              *) echo "$name: clean or nothing to scan (exit ${code:-?})." ;;
-            esac
-          done
-          exit "$fail"
+  iac:
+    name: IaC
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: 'npm'
+      - run: npm install -g snyk@${{ vars.SNYK_CLI_VERSION || 'latest' }}
+      - uses: ./.github/actions/snyk-scan
+        with:
+          scan-name: IaC
+          scan-cmd: snyk iac test
+          output-flag: --sarif-file-output
+          results-file: iac.sarif
+          marker: snyk-iac
