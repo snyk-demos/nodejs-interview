@@ -33,8 +33,8 @@ env:
   SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
 jobs:
-  # Fast, non-blocking feedback for feature branches. Dumps results into the
-  # job summary so devs don't have to dig through logs.
+  # Fast, non-blocking feedback for feature branches. 
+  # Dumps results into the job summary so devs don't have to dig through logs.
   quick-scan:
     name: Quick scan (feature branch)
     if: github.event_name == 'push' && github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/heads/release/')
