@@ -1,21 +1,26 @@
 name: Snyk Scans
 # Drop-in caller for the Snyk scan templates. 
-# Feature-branch pushes only:
-# the Snyk SCM integration owns PR checks, blocking (via branch protection),
-# and main-branch tracking; these jobs add visibility inside GitHub on every
-# push.
+#   - Feature branches: SCA, Code, and IaC run on every push, advisory, with
+#     sticky PR comments. The Snyk SCM integration owns
+#     PR checks, blocking (branch protection), and main-branch tracking.
+#   - Default branch: only the container scan runs (the image is built here and
+#     never exists in Git, so the SCM integration cannot cover it), and the
+#     image is snapshotted to Snyk with monitor.
 on:
   push:
-    branches-ignore: [ main ]
+
 permissions:
   contents: read
   pull-requests: write   # sticky PR comments
+
 concurrency:
   group: snyk-${{ github.ref }}
   cancel-in-progress: true
+
 jobs:
   sca:
     name: SCA
+    if: github.ref_name != github.event.repository.default_branch
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -29,9 +34,11 @@ jobs:
           snyk-token: ${{ secrets.SNYK_TOKEN }}
           # fail-on-findings: "true"        # flip when this check should fail
           # severity-threshold: critical    # what "fail" means, per scan
+          # extra-args: "--all-projects"    # monorepos
 
   code:
     name: Code
+    if: github.ref_name != github.event.repository.default_branch
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -41,17 +48,21 @@ jobs:
 
   iac:
     name: IaC
+    if: github.ref_name != github.event.repository.default_branch
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: snyk-demos/snyk-scan-templates/iac@v1
         with:
           snyk-token: ${{ secrets.SNYK_TOKEN }}
-          pr-comment: "false"               # example: summary only, no comment
+          # pr-comment defaults to "true": IaC results land on the open PR
+          # as a sticky comment and in the run summary.
 
-  # Optional: only for repos that build an image. Build first, then scan.
+  # Default branch only: build the release image, scan it, and snapshot it to
+  # the Snyk platform for ongoing tracking against new disclosures.
   container:
     name: Container
+    if: github.ref_name == github.event.repository.default_branch
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -60,3 +71,7 @@ jobs:
         with:
           snyk-token: ${{ secrets.SNYK_TOKEN }}
           image: local/app:${{ github.sha }}
+          pr-comment: "false"               # default-branch push has no PR
+          monitor: "true"                   # track this image in Snyk
+          project-name: app                 # stable name, no sha or registry
+          target-reference: ${{ github.ref_name }}
