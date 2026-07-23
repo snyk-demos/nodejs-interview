@@ -4,7 +4,9 @@ name: Snyk
 # Sets the baseline Code Scanning compares future PRs against, refreshes the
 # Snyk monitor, and scans the built image since that's something the platform
 # can't see on its own.
-
+#
+# No PR decoration here (there is no PR), but the job summary gets a compact
+# table of what was scanned and uploaded so the run is auditable at a glance.
 on:
   push:
     branches: [ main, 'release/**' ]
@@ -18,30 +20,60 @@ concurrency:
   cancel-in-progress: false   # never cancel a baseline, it must complete
 env:
   SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+  # Project attributes stamped on every project this workflow creates, so
+  # nothing shows up on the platform without metadata. Adjust to your reality.
+  # NOTE: setting attributes requires the token role to have permission to
+  # edit project attributes, and --report requires View Project Ignores.
+  # SNYK_TAGS is the RELATION: every project this workflow publishes (deps,
+  # code, container) carries repo=<name>. Filter by that tag in the Projects
+  # view to see the whole service across both targets. This is how the image
+  # and the repo stay linked despite living in separate targets.
+  SNYK_TAGS: managed-by=github-actions,repo=${{ github.event.repository.name }}
+  SNYK_ATTRS: >-
+    --project-environment=backend
+    --project-lifecycle=production
+    --project-business-criticality=high
   # Pin the Snyk org for EVERY command (test, code test, monitor, container).
   # Without this, projects land in the token's default org, and snyk code test
-  # 403s if Snyk Code isn't enabled there. Set SNYK_ORG as a repo variable
-  # (org slug from https://app.snyk.io/org/<slug>).
-  SNYK_CFG_ORG: ${{ vars.SNYK_ORG }}
+  # 403s if Snyk Code isn't enabled there. Same SNYK_ORG secret as the gate
+  # and quick-scan workflows, ONE source of truth.
+  SNYK_CFG_ORG: ${{ secrets.SNYK_ORG }}
 jobs:
   baseline:
     name: Baseline Refresh
     runs-on: ubuntu-latest
     steps:
-      # Container target naming: CLI container projects form their OWN target
-      # keyed by image name, they cannot be merged into the git repo target
-      # (container monitor has no --remote-repo-url).
+      # Container identity: the image IS its own entity in Snyk (container
+      # targets are keyed by image name, and container monitor has no
+      # --remote-repo-url), so name it by its REAL image coordinates instead
+      # of overloading the repo name onto it. Set IMAGE_NAME as a repo
+      # variable to the actual image path (e.g. registry/team/service);
+      # falls back to the repo name. The link back to the repo projects is
+      # the repo=<name> tag in SNYK_TAGS, not the name. Name is FIXED at
+      # first monitor, so delete any previously created container target
+      # with a different name in the UI.
       - name: Set image name
-        run: echo "IMAGE_NAME=${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+        run: |
+          IMAGE='${{ vars.IMAGE_NAME }}'
+          [ -z "$IMAGE" ] && IMAGE="${GITHUB_REPOSITORY#*/}"
+          echo "IMAGE_NAME=${IMAGE,,}" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 18
           cache: 'npm'
       - run: npm install -g snyk
+      # IaC runs BEFORE npm install: with node_modules present, snyk iac tries
+      # to parse fixture/tsconfig JSON inside dependencies and fails with
+      # SNYK-CLI-0012 parse errors (as seen in previous runs).
       - name: IaC
         continue-on-error: true
-        run: snyk iac test --sarif-file-output=snyk-iac.sarif || true
+        run: >
+          snyk iac test --sarif-file-output=snyk-iac.sarif
+          --report
+          --remote-repo-url=${{ github.server_url }}/${{ github.repository }}
+          --target-reference=${{ github.ref_name }}
+          || true
       - run: npm install --ignore-scripts
       # Full scans, SARIF out, then upload. This is what becomes the new
       # baseline for PR diffs.
@@ -51,6 +83,20 @@ jobs:
       - name: SAST
         continue-on-error: true
         run: snyk code test --sarif-file-output=snyk-code.sarif
+      # Publishes SAST results to the Snyk platform as a Code project under
+      # the SAME target and branch reference as the dependency project.
+      # Without this, snyk code test is invisible on the platform.
+      # No || true here on purpose: if this 403s (wrong org, or the token
+      # role lacks View Project Ignores), the step must show red so the
+      # missing Code project on the platform is explainable from the run.
+      - name: SAST report to platform
+        continue-on-error: true
+        run: >
+          snyk code test --report
+          --project-name=code-analysis
+          --remote-repo-url=${{ github.server_url }}/${{ github.repository }}
+          --target-reference=${{ github.ref_name }}
+          --project-tags="$SNYK_TAGS"
       - name: Upload SCA baseline
         if: hashFiles('snyk-sca.sarif') != ''
         uses: github/codeql-action/upload-sarif@v3
@@ -63,7 +109,9 @@ jobs:
         if: hashFiles('snyk-iac.sarif') != ''
         uses: github/codeql-action/upload-sarif@v3
         with: { sarif_file: snyk-iac.sarif, category: snyk-iac }
-      # Refreshes the Snyk platform monitor.
+      # Refreshes the Snyk platform monitor. Skip this if the repo is already
+      # SCM-imported on the platform side, otherwise you end up with a
+      # duplicate project.
       # --remote-repo-url groups all detected projects under one target in the
       # Snyk UI. --target-reference tags the snapshot with the branch, so main
       # and release/* keep separate histories instead of overwriting each other.
@@ -72,6 +120,8 @@ jobs:
           snyk monitor --all-projects
           --remote-repo-url=${{ github.server_url }}/${{ github.repository }}
           --target-reference=${{ github.ref_name }}
+          $SNYK_ATTRS
+          --project-tags="$SNYK_TAGS"
           || true
       - name: Build image
         run: docker build -t "$IMAGE_NAME:${{ github.sha }}" .
@@ -92,7 +142,9 @@ jobs:
             --file=Dockerfile \
             --exclude-node-modules \
             --project-name="$IMAGE_NAME" \
-            --target-reference=${{ github.ref_name }}
+            --target-reference=${{ github.ref_name }} \
+            $SNYK_ATTRS \
+            --project-tags="$SNYK_TAGS"
       - name: Upload container baseline
         if: hashFiles('snyk-container.sarif') != ''
         uses: github/codeql-action/upload-sarif@v3
