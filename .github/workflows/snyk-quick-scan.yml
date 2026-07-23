@@ -1,4 +1,4 @@
-name: Snyk Quick Scan
+name: Snyk 
 
 # Fires ONLY on pushes to feature branches. Nothing else triggers this file,
 # so PR and baseline runs won't show a skipped job for it in the checks list.
@@ -22,7 +22,7 @@ env:
 
 jobs:
   quick-scan:
-    name: Snyk - Quick scan
+    name: Scan
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
