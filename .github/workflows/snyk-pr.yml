@@ -1,0 +1,102 @@
+name: Snyk PR
+# Feature branches only. Runs SAST, SCA and IaC, then decorates: one step
+# summary and one sticky PR comment covering all three. Nothing here reaches
+# the Snyk platform and nothing here blocks a merge.
+#
+# Push-triggered rather than pull_request: a branch with an open PR would fire
+# both events and run everything twice. The SCM integration owns PR blocking.
+on:
+  push:
+    branches-ignore: [ main ]   # literal default branch; snyk-main.yml owns it
+  workflow_dispatch: {}
+permissions:
+  contents: read
+  pull-requests: write   # upsert the sticky PR comment
+concurrency:
+  group: snyk-pr-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+  SNYK_CFG_ORG: ${{ secrets.SNYK_ORG }}
+jobs:
+  scan:
+    name: Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: 'npm'
+      # Pin via the SNYK_CLI_VERSION repo variable for reproducible runs.
+      - run: npm install -g snyk@${{ vars.SNYK_CLI_VERSION || 'latest' }}
+      - run: npm install --ignore-scripts
+
+      # exit codes: 0 clean, 1 findings, 2 error, 3 nothing to scan.
+      # continue-on-error everywhere: findings never fail a feature branch, and
+      # one broken scan must not hide the other two.
+      # --severity-threshold=high keeps the PR comment signal-heavy. The default
+      # branch drops it, because the platform should record everything.
+      - name: SCA test
+        id: sca
+        continue-on-error: true
+        run: |
+          set +e
+          snyk test --severity-threshold=high --json-file-output=sca.json
+          echo "code=$?" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: SAST test
+        id: sast
+        continue-on-error: true
+        run: |
+          set +e
+          snyk code test --severity-threshold=high --sarif-file-output=sast.sarif
+          echo "code=$?" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: IaC test
+        id: iac
+        continue-on-error: true
+        run: |
+          set +e
+          snyk iac test --severity-threshold=high --sarif-file-output=iac.sarif
+          echo "code=$?" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      # One report for all three, then a single sticky comment keyed on a hidden
+      # marker so re-pushes edit in place instead of stacking new comments.
+      # Pushes with no open PR (or from a fork, which raises no push event here)
+      # fall through to the summary only.
+      - name: Report
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          MARK: <!-- snyk-pr -->
+        run: |
+          render() {
+            RENDER_TITLE="$1" RENDER_FILE="$2" RENDER_EXIT="$3" RENDER_OUT=report.md \
+              python3 .github/scripts/render.py
+          }
+          render "Snyk SCA (high/critical only)"  sca.json   "${{ steps.sca.outputs.code }}"
+          render "Snyk SAST (high/critical only)" sast.sarif "${{ steps.sast.outputs.code }}"
+          render "Snyk IaC (high/critical only)"  iac.sarif  "${{ steps.iac.outputs.code }}"
+          cat report.md >> "$GITHUB_STEP_SUMMARY"
+
+          pr=$(gh pr list --head "$GITHUB_REF_NAME" --state open \
+                 --json number --jq '.[0].number // empty') || pr=""
+          if [ -z "$pr" ]; then
+            echo "No open PR for $GITHUB_REF_NAME, summary only."
+            exit 0
+          fi
+
+          { echo "$MARK"; head -c 60000 report.md; } > comment.md
+          id=$(gh api "repos/${GH_REPO}/issues/${pr}/comments" --paginate \
+                 --jq "[.[] | select((.body // \"\") | startswith(\"$MARK\"))] | .[0].id // empty") || id=""
+
+          if [ -n "$id" ]; then
+            gh api -X PATCH "repos/${GH_REPO}/issues/comments/${id}" -F body=@comment.md
+          else
+            gh api "repos/${GH_REPO}/issues/${pr}/comments" -F body=@comment.md
+          fi
