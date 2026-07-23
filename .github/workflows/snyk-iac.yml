@@ -1,11 +1,13 @@
 name: Snyk IaC
-# Feature-branch pushes only: decorated, non-blocking feedback on the run's
-# Summary page. PR blocking + baseline come from the Snyk repo integration.
+# Feature-branch pushes only (never pull_request; the repo integration owns
+# PR diffing and blocking). Decorated, non-blocking feedback: run summary
+# plus a "IaC Results" check whose Details page shows the report directly.
 on:
   push:
     branches-ignore: [ main, 'release/**' ]
 permissions:
   contents: read
+  checks: write   # publish the results check run
 concurrency:
   group: snyk-iac-${{ github.ref }}
   cancel-in-progress: true
@@ -107,3 +109,24 @@ jobs:
           EOF
           python3 render.py
           cat report.md >> "$GITHUB_STEP_SUMMARY"
+      # Check Run "Snyk IaC Results": its Details page renders the report directly,
+      # no digging through logs. neutral = findings, informational only.
+      - name: Publish results check
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SCAN_CODE: ${{ steps.scan.outputs.code }}
+        run: |
+          case "$SCAN_CODE" in
+            0|3) conc=success ;;
+            2)   conc=failure ;;
+            *)   conc=neutral ;;
+          esac
+          head -c 60000 report.md > check.md
+          gh api "repos/${GITHUB_REPOSITORY}/check-runs" \
+            -f name="Snyk IaC Results" \
+            -f head_sha="${GITHUB_SHA}" \
+            -f status=completed \
+            -f conclusion="$conc" \
+            -f "output[title]=Snyk IaC Results" \
+            -F "output[summary]=@check.md"
