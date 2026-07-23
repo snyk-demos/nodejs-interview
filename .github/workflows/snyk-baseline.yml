@@ -1,0 +1,79 @@
+name: Snyk Baseline
+
+# Fires ONLY on pushes to a protected branch, plus manual runs.
+#
+# Sets the baseline Code Scanning compares future PRs against, refreshes the
+# Snyk monitor, and scans the built image since that's something the platform
+# can't see on its own.
+
+on:
+  push:
+    branches: [ main, 'release/**' ]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  security-events: write   # needed to upload SARIF to Code Scanning
+  # actions: read          # uncomment for PRIVATE repos, upload fails without it
+
+concurrency:
+  group: snyk-baseline-${{ github.ref }}
+  cancel-in-progress: false   # never cancel a baseline, it must complete
+
+env:
+  SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+jobs:
+  baseline:
+    name: Snyk - Baseline Refresh
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: 'npm'
+      - run: npm install --ignore-scripts
+      - run: npm install -g snyk
+
+      # Full scans, SARIF out, then upload. This is what becomes the new
+      # baseline for PR diffs.
+      - name: SCA
+        continue-on-error: true
+        run: snyk test --sarif-file-output=snyk-sca.sarif
+      - name: SAST
+        continue-on-error: true
+        run: snyk code test --sarif-file-output=snyk-code.sarif
+      - name: IaC
+        continue-on-error: true
+        run: snyk iac test --sarif-file-output=snyk-iac.sarif || true
+      - name: Upload SCA baseline
+        if: hashFiles('snyk-sca.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with: { sarif_file: snyk-sca.sarif, category: snyk-sca }
+      - name: Upload SAST baseline
+        if: hashFiles('snyk-code.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with: { sarif_file: snyk-code.sarif, category: snyk-code }
+      - name: Upload IaC baseline
+        if: hashFiles('snyk-iac.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with: { sarif_file: snyk-iac.sarif, category: snyk-iac }
+
+      # Refreshes the Snyk platform monitor. Skip this if the repo is already
+      # SCM-imported on the platform side, otherwise you end up with a
+      # duplicate project.
+      - name: Snyk monitor (code + deps baseline)
+        run: snyk monitor --all-projects --remote-repo-url=${{ github.server_url }}/${{ github.repository }} || true
+
+      - name: Build image
+        run: docker build -t nova-bank-goof:${{ github.sha }} .
+      - name: Snyk Container test + monitor
+        continue-on-error: true
+        run: |
+          snyk container test    nova-bank-goof:${{ github.sha }} --file=Dockerfile --severity-threshold=high --sarif-file-output=snyk-container.sarif || true
+          snyk container monitor nova-bank-goof:${{ github.sha }} --file=Dockerfile
+      - name: Upload container baseline
+        if: hashFiles('snyk-container.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with: { sarif_file: snyk-container.sarif, category: snyk-container }

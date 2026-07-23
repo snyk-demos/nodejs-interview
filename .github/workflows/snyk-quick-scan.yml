@@ -1,0 +1,44 @@
+name: Snyk Quick Scan
+
+# Fires ONLY on pushes to feature branches. Nothing else triggers this file,
+# so PR and baseline runs won't show a skipped job for it in the checks list.
+#
+# Fast, non-blocking feedback. Dumps results into the job summary so devs
+# don't have to dig through logs. The PR gate is where issues actually block.
+
+on:
+  push:
+    branches-ignore: [ main, 'release/**' ]
+
+permissions:
+  contents: read          # no SARIF upload here, so nothing else is needed
+
+concurrency:
+  group: snyk-quick-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+jobs:
+  quick-scan:
+    name: Snyk - Quick scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: 'npm'
+      - run: npm install --ignore-scripts
+      - run: npm install -g snyk
+
+      - name: Quick SCA + SAST + IaC (high/critical, non-blocking)
+        run: |
+          echo "## Snyk quick scan" >> "$GITHUB_STEP_SUMMARY"
+          echo "Fast feedback only. The PR gate is where issues block." >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          snyk test        --severity-threshold=high 2>&1 | tee -a "$GITHUB_STEP_SUMMARY" || true
+          snyk code test   --severity-threshold=high 2>&1 | tee -a "$GITHUB_STEP_SUMMARY" || true
+          snyk iac test    --severity-threshold=high 2>&1 | tee -a "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
