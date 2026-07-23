@@ -8,9 +8,10 @@ name: Snyk
 # GitHub Code Scanning diffs new findings against the baseline for the target
 # branch, and the code-scanning check is what actually blocks the merge.
 #
-# Decorations: each matrix leg renders a markdown report (severity counts,
-# top fixes, finding table) into the job summary AND a sticky PR comment.
-# One comment per scan type, updated in place on every push, no comment spam.
+# Decorations: each matrix leg renders a markdown report grouped by severity
+# (critical/high expanded, medium/low collapsed) into the job summary AND a
+# sticky PR comment. One comment per scan type, updated in place on every
+# push, no comment spam.
 on:
   pull_request:
     branches: [ main, 'release/**' ]   # filters on the PR's TARGET branch
@@ -24,7 +25,7 @@ concurrency:
   cancel-in-progress: true
 env:
   SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-  # Same org as the baseline workflow, so test results, .snyk policies, and
+  # Same org as the other workflows, so test results, .snyk policies, and
   # Snyk Code enablement match what the platform projects use.
   SNYK_CFG_ORG: ${{ secrets.SNYK_ORG }}
 jobs:
@@ -88,9 +89,11 @@ jobs:
           cat > render.py << 'EOF'
           import json, os
 
-          SEV_ICON = {"critical": "\U0001F6A8 Critical", "high": "\U0001F534 High", "medium": "\U0001F7E0 Medium", "low": "\U0001F7E1 Low"}
-          LEVEL_MAP = {"error": "\U0001F534 High", "warning": "\U0001F7E0 Medium", "note": "\U0001F7E1 Low"}
-          LEVEL_RANK = {"error": 0, "warning": 1, "note": 2}
+          SEV_ORDER = ["critical", "high", "medium", "low"]
+          SEV_ICON = {"critical": "\U0001F6A8", "high": "\U0001F534", "medium": "\U0001F7E0", "low": "\U0001F7E1"}
+          SEV_LABEL = {"critical": "Critical", "high": "High", "medium": "Medium", "low": "Low"}
+          LEVEL_TO_SEV = {"error": "high", "warning": "medium", "note": "low"}
+          OPEN_BY_DEFAULT = {"critical", "high"}
 
           def load(path):
               try:
@@ -100,34 +103,52 @@ jobs:
               except Exception:
                   return None
 
+          def details_block(sev, count, table_lines):
+              open_attr = " open" if sev in OPEN_BY_DEFAULT else ""
+              out = [f"<details{open_attr}>", f"<summary>{SEV_ICON[sev]} <b>{SEV_LABEL[sev]}</b>: {count} issue(s)</summary>", ""]
+              out += table_lines
+              out += ["", "</details>", ""]
+              return out
+
           def render_sca(path):
               d = load(path)
               if not d:
                   return ["\u26A0\uFE0F Scan produced no output. Check the step log (auth error or unsupported project)."]
               vulns = d.get("vulnerabilities") or []
               if not vulns:
-                  return ["\u2705 No dependency issues at or above the configured threshold."]
-              counts = {}
+                  return ["\u2705 No dependency issues found."]
+              uniq = {}
               for v in vulns:
-                  s = v.get("severity", "unknown")
-                  counts[s] = counts.get(s, 0) + 1
-              unique = d.get("uniqueCount", len(vulns))
-              parts = " | ".join(f"{SEV_ICON.get(s, s)}: {counts[s]}" for s in ("critical", "high", "medium", "low") if s in counts)
-              out = [f"**{unique} unique issues across {len(vulns)} vulnerable paths** | {parts}", ""]
+                  uniq.setdefault(v.get("id"), v)
+              by_sev = {}
+              for v in uniq.values():
+                  by_sev.setdefault(v.get("severity", "low"), []).append(v)
+              parts = " | ".join(f"{SEV_ICON[s]} {SEV_LABEL[s]}: {len(by_sev[s])}" for s in SEV_ORDER if s in by_sev)
+              out = [f"**{len(uniq)} unique issues across {len(vulns)} vulnerable paths** | {parts}", ""]
+              for sev in SEV_ORDER:
+                  if sev not in by_sev:
+                      continue
+                  rows = ["| Issue | Package | Fixed in |", "|---|---|---|"]
+                  for v in sorted(by_sev[sev], key=lambda x: x.get("packageName", "")):
+                      fixed = ", ".join((v.get("fixedIn") or [])[:3]) or "-"
+                      rows.append(f"| {v.get('title','?')} | `{v.get('packageName','?')}@{v.get('version','?')}` | `{fixed}` |")
+                  out += details_block(sev, len(by_sev[sev]), rows)
               upgrades = (d.get("remediation") or {}).get("upgrade") or {}
               if upgrades:
-                  out += ["**Top fixes by impact** (bump these first):", "", "| Upgrade | To | Fixes |", "|---|---|---|"]
+                  rows = ["| Upgrade | To | Fixes |", "|---|---|---|"]
                   ranked = sorted(upgrades.items(), key=lambda kv: -len(kv[1].get("vulns", [])))
                   for pkg, info in ranked[:10]:
-                      out.append(f"| `{pkg}` | `{info.get('upgradeTo','?')}` | {len(info.get('vulns', []))} issues |")
+                      rows.append(f"| `{pkg}` | `{info.get('upgradeTo','?')}` | {len(info.get('vulns', []))} issues |")
                   if len(ranked) > 10:
-                      out += ["", f"...plus {len(ranked)-10} more upgrades, see the run log."]
+                      rows += ["", f"...plus {len(ranked)-10} more upgrades, see the run log."]
+                  out += ["<details open>", "<summary>\U0001F527 <b>Top fixes by impact</b> (bump these first)</summary>", ""]
+                  out += rows + ["", "</details>", ""]
               unresolved = (d.get("remediation") or {}).get("unresolved") or []
               if unresolved:
-                  out += ["", f"\u26A0\uFE0F {len(unresolved)} issues have **no direct upgrade** (transitive pins), see run log for fixed-in versions."]
+                  out += [f"\u26A0\uFE0F {len(unresolved)} issues have **no direct upgrade** (transitive pins), see run log for fixed-in versions.", ""]
               return out
 
-          def render_sarif(path, limit=15):
+          def render_sarif(path, limit=25):
               d = load(path)
               if not d:
                   return ["\u26A0\uFE0F Scan produced no output. Check the step log (auth/enablement error or no supported files)."]
@@ -137,20 +158,23 @@ jobs:
               results = run.get("results") or []
               if not results:
                   return ["\u2705 No findings."]
-              counts = {}
+              by_sev = {}
               for r in results:
-                  l = r.get("level", "warning")
-                  counts[l] = counts.get(l, 0) + 1
-              parts = " | ".join(f"{LEVEL_MAP.get(l, l)}: {counts[l]}" for l in ("error", "warning", "note") if l in counts)
-              out = [f"**{len(results)} findings** | {parts}", "", "| Severity | Issue | Location |", "|---|---|---|"]
-              results = sorted(results, key=lambda r: LEVEL_RANK.get(r.get("level"), 9))
-              for r in results[:limit]:
-                  loc = ((r.get("locations") or [{}])[0].get("physicalLocation") or {})
-                  uri = (loc.get("artifactLocation") or {}).get("uri", "?")
-                  line = (loc.get("region") or {}).get("startLine", "?")
-                  out.append(f"| {LEVEL_MAP.get(r.get('level'), r.get('level'))} | {rules.get(r.get('ruleId'), r.get('ruleId'))} | `{uri}:{line}` |")
-              if len(results) > limit:
-                  out += ["", f"...plus {len(results)-limit} more, see the Security tab or run log."]
+                  by_sev.setdefault(LEVEL_TO_SEV.get(r.get("level"), "low"), []).append(r)
+              parts = " | ".join(f"{SEV_ICON[s]} {SEV_LABEL[s]}: {len(by_sev[s])}" for s in SEV_ORDER if s in by_sev)
+              out = [f"**{len(results)} findings** | {parts}", ""]
+              for sev in SEV_ORDER:
+                  if sev not in by_sev:
+                      continue
+                  rows = ["| Issue | Location |", "|---|---|"]
+                  for r in by_sev[sev][:limit]:
+                      loc = ((r.get("locations") or [{}])[0].get("physicalLocation") or {})
+                      uri = (loc.get("artifactLocation") or {}).get("uri", "?")
+                      line = (loc.get("region") or {}).get("startLine", "?")
+                      rows.append(f"| {rules.get(r.get('ruleId'), r.get('ruleId'))} | `{uri}:{line}` |")
+                  if len(by_sev[sev]) > limit:
+                      rows += ["", f"...plus {len(by_sev[sev])-limit} more, see the Security tab or run log."]
+                  out += details_block(sev, len(by_sev[sev]), rows)
               return out
 
           def main():
