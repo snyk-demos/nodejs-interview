@@ -7,11 +7,6 @@ name: Snyk
 # Every scan runs with continue-on-error and uploads its SARIF.
 # GitHub Code Scanning diffs new findings against the baseline for the target
 # branch, and the code-scanning check is what actually blocks the merge.
-#
-# Decorations: each matrix leg renders a markdown report grouped by severity
-# (critical/high expanded, medium/low collapsed) into the job summary AND a
-# sticky PR comment. One comment per scan type, updated in place on every
-# push, no comment spam.
 on:
   pull_request:
     branches: [ main, 'release/**' ]   # filters on the PR's TARGET branch
