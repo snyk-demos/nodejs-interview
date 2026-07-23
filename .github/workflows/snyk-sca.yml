@@ -1,0 +1,114 @@
+name: Snyk SCA
+# Feature-branch pushes only: decorated, non-blocking feedback on the run's
+# Summary page. PR blocking + baseline come from the Snyk repo integration.
+on:
+  push:
+    branches-ignore: [ main, 'release/**' ]
+permissions:
+  contents: read
+concurrency:
+  group: snyk-sca-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+  SNYK_CFG_ORG: ${{ secrets.SNYK_ORG }}   # same org secret in all workflows
+jobs:
+  scan:
+    name: SCA
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: 'npm'
+      - run: npm install -g snyk
+      - run: npm install --ignore-scripts
+      # exit codes: 0 clean, 1 findings, 2 error, 3 nothing to scan; only 2 fails
+      - name: SCA scan
+        id: scan
+        continue-on-error: true
+        run: |
+          set +e
+          snyk test --severity-threshold=high --json-file-output=results.json
+          code=$?
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          if [ "$code" -eq 2 ]; then exit 2; fi
+          exit 0
+      - name: Report
+        if: always()
+        env:
+          RENDER_TITLE: Snyk SCA (high/critical only)
+          RENDER_FILE: results.json
+          RENDER_EXIT: ${{ steps.scan.outputs.code }}
+          RENDER_OUT: report.md
+        run: |
+          cat > render.py << 'EOF'
+          import json, os
+          SEV_ORDER = ["critical", "high", "medium", "low"]
+          SEV_ICON = {"critical": "\U0001F6A8", "high": "\U0001F534", "medium": "\U0001F7E0", "low": "\U0001F7E1"}
+          SEV_LABEL = {"critical": "Critical", "high": "High", "medium": "Medium", "low": "Low"}
+          OPEN_BY_DEFAULT = {"critical", "high"}
+          
+          def load(path):
+              try:
+                  with open(path) as f:
+                      d = json.load(f)
+                  return d[0] if isinstance(d, list) and d else d
+              except Exception:
+                  return None
+          
+          def details_block(sev, count, rows):
+              o = " open" if sev in OPEN_BY_DEFAULT else ""
+              return [f"<details{o}>", f"<summary>{SEV_ICON[sev]} <b>{SEV_LABEL[sev]}</b>: {count} issue(s)</summary>", ""] + rows + ["", "</details>", ""]
+          
+          def render(path):
+              d = load(path)
+              if not d:
+                  return ["\u26A0\uFE0F Scan produced no output. Check the step log."]
+              vulns = d.get("vulnerabilities") or []
+              if not vulns:
+                  return ["\u2705 No high/critical dependency issues."]
+              uniq = {}
+              for v in vulns:
+                  uniq.setdefault(v.get("id"), v)
+              by_sev = {}
+              for v in uniq.values():
+                  by_sev.setdefault(v.get("severity", "low"), []).append(v)
+              parts = " | ".join(f"{SEV_ICON[s]} {SEV_LABEL[s]}: {len(by_sev[s])}" for s in SEV_ORDER if s in by_sev)
+              out = [f"**{len(uniq)} unique issues across {len(vulns)} vulnerable paths** | {parts}", ""]
+              for sev in SEV_ORDER:
+                  if sev not in by_sev:
+                      continue
+                  rows = ["| Issue | Package | Fixed in |", "|---|---|---|"]
+                  for v in sorted(by_sev[sev], key=lambda x: x.get("packageName", "")):
+                      fixed = ", ".join((v.get("fixedIn") or [])[:3]) or "-"
+                      rows.append(f"| {v.get('title','?')} | `{v.get('packageName','?')}@{v.get('version','?')}` | `{fixed}` |")
+                  out += details_block(sev, len(by_sev[sev]), rows)
+              upgrades = (d.get("remediation") or {}).get("upgrade") or {}
+              if upgrades:
+                  rows = ["| Upgrade | To | Fixes |", "|---|---|---|"]
+                  ranked = sorted(upgrades.items(), key=lambda kv: -len(kv[1].get("vulns", [])))
+                  for pkg, info in ranked[:10]:
+                      rows.append(f"| `{pkg}` | `{info.get('upgradeTo','?')}` | {len(info.get('vulns', []))} issues |")
+                  out += ["<details open>", "<summary>\U0001F527 <b>Top fixes by impact</b> (bump these first)</summary>", ""] + rows + ["", "</details>", ""]
+              unresolved = (d.get("remediation") or {}).get("unresolved") or []
+              if unresolved:
+                  out += [f"\u26A0\uFE0F {len(unresolved)} issues have **no direct upgrade** (transitive pins), see run log.", ""]
+              return out
+          
+          def main():
+              title = os.environ.get("RENDER_TITLE", "")
+              lines = ([f"## {title}", ""] if title else [])
+              if os.environ.get("RENDER_EXIT") == "3":
+                  lines += ["\u2139\uFE0F No supported files for this scan type in the repo, nothing to scan."]
+              else:
+                  lines += render(os.environ["RENDER_FILE"])
+              lines.append("")
+              with open(os.environ.get("RENDER_OUT", "report.md"), "a", encoding="utf-8") as f:
+                  f.write("\n".join(lines) + "\n")
+          
+          main()
+          EOF
+          python3 render.py
+          cat report.md >> "$GITHUB_STEP_SUMMARY"
