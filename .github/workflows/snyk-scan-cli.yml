@@ -14,8 +14,7 @@ permissions:
   actions: read
 concurrency:
   group: snyk-${{ github.event.pull_request.number || github.ref_name }}
-  # Never cancel a default-branch, as those produce the code
-  # scanning baseline and the Snyk snapshots.
+  # Never cancel a default-branch, as those produce the code scanning baseline.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   sca:
@@ -50,8 +49,6 @@ jobs:
           project-tags: app=${{ github.event.repository.name }}
   iac:
     name: IaC
-    # Do NOT install dependencies here. Snyk IaC walks the whole tree, dies on
-    # malformed JSON in node_modules, and has no --exclude flag.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 15
