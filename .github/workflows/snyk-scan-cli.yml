@@ -10,11 +10,8 @@ on:
 permissions:
   contents: read
   pull-requests: write   # sticky PR comments
-  security-events: write # upload SARIF to code scanning
-  actions: read          # required by code scanning on private repos
 concurrency:
   group: snyk-ci-${{ github.event.pull_request.number || github.ref_name }}
-  # Never cancel a default-branch run, it produces the code scanning baseline.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   sca:
@@ -28,6 +25,8 @@ jobs:
       - uses: snyk-demos/snyk-scan-templates/sca@v1
         with:
           snyk-token: ${{ secrets.SNYK_TOKEN }}
+          pr-comment: false
+          upload-sarif: false
           # monitor stays "false": the SCM integration owns the Snyk UI side.
   code:
     name: Code
@@ -39,6 +38,8 @@ jobs:
       - uses: snyk-demos/snyk-scan-templates/code@v1
         with:
           snyk-token: ${{ secrets.SNYK_TOKEN }}
+          pr-comment: false
+          upload-sarif: false
   iac:
     name: IaC
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
@@ -49,3 +50,5 @@ jobs:
       - uses: snyk-demos/snyk-scan-templates/iac@v1
         with:
           snyk-token: ${{ secrets.SNYK_TOKEN }}
+          pr-comment: false
+          upload-sarif: false
