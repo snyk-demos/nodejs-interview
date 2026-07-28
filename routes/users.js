@@ -1,9 +1,30 @@
 
 var express = require('express')
 var typeorm = require("typeorm");
+var mysql = require('mysql')
 
 var router = express.Router()
 module.exports = router
+
+router.get('/search', function (req, res, next) {
+  const connection = mysql.createConnection({
+    host: 'localhost',
+    user: 'root',
+    password: 'root',
+    database: 'acme'
+  })
+
+  const name = req.query.name
+
+  // SQL Injection: user-controlled input concatenated directly into the query string
+  const query = "SELECT id, name, address, role FROM users WHERE name = '" + name + "'"
+
+  connection.query(query, function (err, results) {
+    connection.end()
+    if (err) return next(err)
+    return res.json(results)
+  })
+})
 
 router.get('/', async (req, res, next) => {
 
